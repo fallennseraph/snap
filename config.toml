@@ -1,0 +1,27 @@
+# snap settings, read each time the overlay opens.
+
+# Show the control hints in the bottom-left corner.
+show_hints = true
+
+# Draw the overlay on the GPU. Turn off to use Windows' software renderer instead.
+hardware_acceleration = true
+
+# A dotted outline of the box from before a move or resize, fading out after.
+old_box_outline = true
+
+# A dotted outline of where the box is going while it springs behind the mouse or a Ctrl/Shift change.
+new_box_outline = false
+
+[animations]
+# Turns every animation below off at once when false.
+enabled = true
+# The overlay fades in when it opens and out when it closes.
+overlay_fade = true
+# The box springs to its new shape when Ctrl or Shift is pressed or released mid-drag.
+modifier_spring = true
+# The box springs after the mouse during fast drags.
+drag_spring = true
+# A white flash in the box when copying it.
+copy_flash = true
+# The same flash over the whole screen when copying all of it.
+copy_flash_full_screen = false
