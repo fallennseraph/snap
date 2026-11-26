@@ -44,10 +44,12 @@ const DOTTED_OPACITY: f32 = 0.5;
 const FLASH_OPACITY: f32 = 0.5;
 const DASH: f32 = 4.0; // length of each dash and each gap in the dotted outlines, in pixels
 
-// What to draw in one frame, besides the screenshot.
+// What to draw in one frame, besides the screenshot, in three layers: the dimming, the box with everything around it
+// (hidden while a dialog is up), then the dialog and the hints over it all.
 pub struct Scene<'a> {
-	pub dim: f32, // how much of the dimming shows, 0 to 1
-	pub ui: f32,  // the opacity of everything drawn over the screenshot
+	pub dim: f32,  // how much of the dimming shows, 0 to 1
+	pub ui: f32,   // the opacity of everything drawn over the screenshot
+	pub main: f32, // how much the box layer shows, on top of `ui`; as it hides, the box's hole in the dimming closes
 	pub selection: Option<Rect>,
 	pub highlight: &'a [Rect],
 	pub labels: &'a [(Vector2, IDWriteTextLayout)],
@@ -57,7 +59,7 @@ pub struct Scene<'a> {
 	pub hints: Option<(&'a Hints, f32)>,
 	// the row, where it goes, the hovered button and its opacity
 	pub buttons: Option<(&'a Buttons, Rect, Option<Button>, f32)>,
-	pub close: (&'a Buttons, Rect, bool), // the close button in the top-right corner, and whether it's hovered
+	pub close: Option<(&'a Buttons, Rect, bool, f32)>, // the close button in the top-right corner, hovered, opacity
 	pub confirm: Option<(&'a Confirm, Option<Choice>, Instant)>, // with its hovered button, and the time to draw it at
 }
 
@@ -297,11 +299,19 @@ pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: 
 		for rect in around(scene.selection, width, height) {
 			render_target.FillRectangle(&rect_f(rect), &paint.black);
 		}
+		if let Some(rect) = scene.selection
+			&& scene.main < 1.0
+		{
+			paint.black.SetOpacity(DIM_OPACITY * scene.dim * (1.0 - scene.main));
+			render_target.FillRectangle(&rect_f(rect), &paint.black);
+		}
 
-		paint.white.SetOpacity(scene.ui);
+		// the box layer
+		let ui = scene.ui * scene.main;
+		paint.white.SetOpacity(ui);
 		if let Some(rect) = scene.selection {
 			// a black line just outside the white one, so the outline shows on white too
-			paint.black.SetOpacity(scene.ui);
+			paint.black.SetOpacity(ui);
 			let around_outline = Rect {
 				left: rect.left - 1,
 				top: rect.top - 1,
@@ -332,13 +342,13 @@ pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: 
 				bottom: line.bottom + 1.0,
 			};
 			// white dashes over a solid black line, so the gaps are black and it shows on white too
-			paint.with_opacity(render_target, bounds, DOTTED_OPACITY * opacity * scene.ui, || {
+			paint.with_opacity(render_target, bounds, DOTTED_OPACITY * opacity * ui, || {
 				render_target.DrawRectangle(&line, &paint.black, 1.0, None);
 				render_target.DrawRectangle(&line, &paint.white, 1.0, &paint.dashes);
 			});
 		}
-		paint.white.SetOpacity(scene.ui);
-		paint.black.SetOpacity(scene.ui);
+		paint.white.SetOpacity(ui);
+		paint.black.SetOpacity(ui);
 		let factory = render_target.GetFactory();
 		for (origin, layout) in scene.labels {
 			// a round black stroke under the text keeps it readable over the bright box (skipped if it can't be made)
@@ -354,22 +364,25 @@ pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: 
 			render_target.DrawTextLayout(*origin, layout, &paint.white, D2D1_DRAW_TEXT_OPTIONS_NONE);
 		}
 		if let Some((buttons, row, hovered, opacity)) = scene.buttons {
-			buttons.draw(render_target, paint, row, hovered, opacity * scene.ui);
+			buttons.draw(render_target, paint, row, hovered, opacity * ui);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
-		let (buttons, close, hovered) = scene.close;
-		buttons.draw_one(render_target, paint, Button::Close, close, hovered, scene.ui);
-		render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-		if let Some((hints, opacity)) = scene.hints {
-			hints.draw(render_target, paint, opacity * scene.ui);
+		if let Some((buttons, close, hovered, opacity)) = scene.close {
+			buttons.draw_one(render_target, paint, Button::Close, close, hovered, opacity * ui);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
 		if let Some((rect, opacity)) = scene.flash {
-			paint.white.SetOpacity(FLASH_OPACITY * opacity);
+			paint.white.SetOpacity(FLASH_OPACITY * opacity * scene.main);
 			render_target.FillRectangle(&rect_f(rect), &paint.white);
 		}
+
+		// the dialog, then the hints, which describe it too
 		if let Some((confirm, hovered, now)) = scene.confirm {
 			confirm.draw(render_target, paint, scene.ui, hovered, now);
+			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+		}
+		if let Some((hints, opacity)) = scene.hints {
+			hints.draw(render_target, paint, opacity * scene.ui);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
 	}

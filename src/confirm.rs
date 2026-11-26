@@ -1,8 +1,8 @@
 // confirm
 
-// A confirmation drawn in the overlay: a 50% black backdrop over everything, a message in the middle of the screen and
-// two buttons under it, the primary one black on white and the secondary one white with a white outline. Enter picks
-// the primary one and Esc the secondary one. Laid out once when it opens.
+// A confirmation drawn in the overlay: a message in the middle of the screen and two buttons under it, the primary one
+// black on white and the secondary one white with a white outline. Enter picks the primary one and Esc the secondary
+// one. Its backdrop is the overlay's dimming, which covers the whole screen while it's up. Laid out once when it opens.
 
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,6 @@ const BUTTON_GAP: f32 = 8.0;
 const MESSAGE_GAP: f32 = 16.0; // between the message and the buttons
 const OUTLINE: f32 = 1.5; // how far the black stroke under white text and lines reaches past them
 
-const BACKDROP_OPACITY: f32 = 0.5;
 const IDLE_OPACITY: f32 = 0.8; // the buttons, until hovered
 const FADE: Duration = Duration::from_millis(150); // in when it opens, out when it's answered
 
@@ -225,8 +224,6 @@ impl Confirm {
 		};
 		let shown = |choice| if hovered == Some(choice) { 1.0 } else { IDLE_OPACITY };
 		unsafe {
-			black.SetOpacity(BACKDROP_OPACITY * opacity);
-			render_target.FillRectangle(&self.screen, black);
 			black.SetOpacity(1.0);
 			white.SetOpacity(1.0);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);

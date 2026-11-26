@@ -126,7 +126,7 @@ impl Buttons {
 		button_at(row, self.size, self.gap, p)
 	}
 
-	// Where the close button goes on a screen `screen_width` wide.
+	// Where the close button is drawn on a screen `screen_width` wide.
 	pub fn close_rect(&self, screen_width: i32) -> Rect {
 		let margin = scaled(CLOSE_MARGIN, self.scale);
 		Rect {
@@ -134,6 +134,16 @@ impl Buttons {
 			top: margin,
 			right: screen_width - margin,
 			bottom: margin + self.size,
+		}
+	}
+
+	// Where the close button takes clicks: its square stretched up and right to the screen's edges, so the very
+	// corner pixel hits it.
+	pub fn close_hit_rect(&self, screen_width: i32) -> Rect {
+		Rect {
+			top: 0,
+			right: screen_width,
+			..self.close_rect(screen_width)
 		}
 	}
 

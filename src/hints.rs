@@ -1,9 +1,11 @@
 // hints
 
 // The control hints in the bottom-left corner of the overlay: key icons next to what they do, in 50% white with no
-// background. Each row shows only when its control does something right now (the arrows only with a box, for
-// example) and says what it would do (the mouse row follows what's under the mouse), fading in and out while the rows
-// above slide to make room. A key lights up fully while it's held. Laid out once when the overlay opens as lists of shapes that each frame draws.
+// background. Each row shows only when its control does something right now (the arrows only with a box, or Enter and
+// Esc while asking whether to quit, for example) and says what it would do (the mouse row follows what's under the
+// mouse), fading in and out while the rows above
+// slide to make room. The mouse row crossfades when its text changes; the others switch at once. A key lights up fully
+// while it's held. Laid out once when the overlay opens as lists of shapes that each frame draws.
 
 use std::time::{Duration, Instant};
 
@@ -18,6 +20,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::anim::{Tween, cubic_out};
 use crate::config::Keys;
+use crate::confirm::Choice;
 use crate::gpu::{Paint, text_format, text_layout, text_outlines};
 use crate::keys::Chord;
 use crate::selection::Rect;
@@ -38,11 +41,20 @@ pub enum Pointer {
 	Save,
 	Clear,
 	Close,
+	Choice(Choice), // a button of the quit confirmation
+}
+
+// What the overlay is showing, which decides the controls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+	Box,  // the screenshot with the box and its buttons
+	Quit, // asking whether to quit snap, with the box hidden
 }
 
 // What the hints describe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Context {
+	pub mode: Mode,
 	pub has_box: bool,
 	pub pointer: Pointer,
 }
@@ -102,9 +114,9 @@ struct Variant {
 }
 
 struct Row {
-	variants: Vec<Variant>,
-	presence: Tween, // 1 while any version shows; fades the row and makes room for it
-	top: f32,        // as of the last `update`
+	variants: Vec<Variant>, // the one showing is kept while the row fades out
+	presence: Tween,        // 1 while any version shows; fades the row and makes room for it
+	top: f32,               // as of the last `update`
 }
 
 impl Row {
@@ -162,8 +174,13 @@ fn caps(chord: Chord) -> Vec<Key> {
 		.collect()
 }
 
-// Each row as its versions: keys, description and when it shows.
-fn row_specs(keys: &Keys) -> Vec<Vec<(Vec<Key>, &'static str, When)>> {
+// One version of a row: its keys, description and when it shows.
+type Version = (Vec<Key>, &'static str, When);
+
+// Each row as whether it crossfades between its versions, then the versions.
+fn row_specs(keys: &Keys) -> Vec<(bool, Vec<Version>)> {
+	use crate::confirm::Choice::{Primary, Secondary};
+	use Mode::*;
 	use Pointer::*;
 	let text = |label: &str, code: u16| Key::Text(label.to_string(), vec![code]);
 	// without a box, copying copies the whole screen, so both keys go on one row
@@ -173,43 +190,123 @@ fn row_specs(keys: &Keys) -> Vec<Vec<(Vec<Key>, &'static str, When)>> {
 		copy_all.extend(caps(keys.copy_whole));
 	}
 	let mouse = |text: &'static str, when: When| (vec![Key::Mouse], text, when);
+	// a click that does the same as a key shares the key's row, written "mouse / key", and the key's row hides
+	let mouse_or = |chord: Chord, text: &'static str, when: When| {
+		let mut row_keys = vec![Key::Mouse, Key::Or];
+		row_keys.extend(caps(chord));
+		(row_keys, text, when)
+	};
+	// `close` only closes with a box when `cancel` (which clears it) is on another key; otherwise the x's mouse row has no
+	// key with a box
+	let (close_x, plain_close_x, close_row): (When, When, When) = if keys.close != keys.cancel {
+		(
+			|c| c.mode == Box && c.pointer == Close,
+			|_| false,
+			|c| c.mode == Box && c.pointer != Close,
+		)
+	} else {
+		(
+			|c| c.mode == Box && c.pointer == Close && !c.has_box,
+			|c| c.mode == Box && c.pointer == Close && c.has_box,
+			|c| c.mode == Box && !c.has_box && c.pointer != Close,
+		)
+	};
 	vec![
-		vec![
-			mouse("Select an area", |c| c.pointer == Outside && !c.has_box),
-			mouse("Select a new area", |c| c.pointer == Outside && c.has_box),
-			mouse("Move the box", |c| c.pointer == Move),
-			mouse("Resize the box", |c| c.pointer == Resize),
-			mouse("Copy", |c| c.pointer == Copy),
-			mouse("Save", |c| c.pointer == Save),
-			mouse("Clear the box", |c| c.pointer == Clear),
-			mouse("Close", |c| c.pointer == Close),
-		],
-		vec![(vec![text("Ctrl", 0x11)], "Size from the center", |_| true)],
-		vec![
-			(vec![text("Shift", 0x10)], "Keep the shape (square)", |c| {
-				c.pointer != Close
-			}),
-			(vec![text("Shift", 0x10)], "Click to quit snap", |c| c.pointer == Close),
-		],
-		vec![(
-			vec![text("←", 0x25), text("↑", 0x26), text("↓", 0x28), text("→", 0x27)],
-			"Nudge 1 px",
-			|c| c.has_box,
-		)],
-		vec![
-			(copy_all, "Copy the whole screen", |c| !c.has_box),
-			(caps(keys.copy), "Copy", |c| c.has_box),
-		],
-		vec![
-			(caps(keys.save), "Save the whole screen", |c| !c.has_box),
-			(caps(keys.save), "Save", |c| c.has_box),
-		],
+		(
+			true,
+			vec![
+				mouse("Select an area", |c| {
+					c.mode == Box && c.pointer == Outside && !c.has_box
+				}),
+				mouse("Select a new area", |c| {
+					c.mode == Box && c.pointer == Outside && c.has_box
+				}),
+				mouse("Move the box", |c| c.mode == Box && c.pointer == Move),
+				mouse("Resize the box", |c| c.mode == Box && c.pointer == Resize),
+				mouse_or(keys.copy, "Copy", |c| c.mode == Box && c.pointer == Copy),
+				mouse_or(keys.save, "Save", |c| c.mode == Box && c.pointer == Save),
+				mouse_or(keys.cancel, "Clear the box", |c| c.mode == Box && c.pointer == Clear),
+				mouse_or(keys.close, "Close", close_x),
+				mouse("Close", plain_close_x),
+				mouse_or(keys.confirm, "Quit snap", |c| {
+					c.mode == Quit && c.pointer == Choice(Primary)
+				}),
+				mouse_or(keys.cancel, "Cancel", |c| {
+					c.mode == Quit && c.pointer == Choice(Secondary)
+				}),
+			],
+		),
+		(
+			false,
+			vec![(vec![text("Ctrl", 0x11)], "Scale from center", |c| c.mode == Box)],
+		),
+		(
+			false,
+			vec![
+				(vec![text("Shift", 0x10)], "Scale uniformly", |c| {
+					c.mode == Box && c.pointer != Close
+				}),
+				(vec![text("Shift", 0x10)], "Click to quit snap", |c| {
+					c.mode == Box && c.pointer == Close
+				}),
+			],
+		),
+		(
+			false,
+			vec![(
+				vec![text("←", 0x25), text("↑", 0x26), text("↓", 0x28), text("→", 0x27)],
+				"Nudge 1 px",
+				|c| c.mode == Box && c.has_box,
+			)],
+		),
+		(
+			false,
+			vec![
+				(copy_all, "Copy the whole screen", |c| c.mode == Box && !c.has_box),
+				(caps(keys.copy), "Copy", |c| {
+					c.mode == Box && c.has_box && c.pointer != Copy
+				}),
+			],
+		),
+		(
+			false,
+			vec![
+				(caps(keys.save), "Save the whole screen", |c| {
+					c.mode == Box && !c.has_box
+				}),
+				(caps(keys.save), "Save", |c| {
+					c.mode == Box && c.has_box && c.pointer != Save
+				}),
+			],
+		),
 		// the copy row covers it without a box
-		vec![(caps(keys.copy_whole), "Copy the whole screen", |c| c.has_box)],
-		vec![
-			(caps(keys.close), "Close", |c| !c.has_box),
-			(caps(keys.close), "Clear the box", |c| c.has_box),
-		],
+		(
+			false,
+			vec![(caps(keys.copy_whole), "Copy the whole screen", |c| {
+				c.mode == Box && c.has_box
+			})],
+		),
+		(
+			false,
+			vec![(caps(keys.cancel), "Clear the box", |c| {
+				c.mode == Box && c.has_box && c.pointer != Clear
+			})],
+		),
+		(false, vec![(caps(keys.close), "Close", close_row)]),
+		(false, vec![(caps(keys.quit), "Quit snap", |c| c.mode == Box)]),
+		// the quit confirmation's
+		(
+			false,
+			vec![(caps(keys.confirm), "Quit snap", |c| {
+				c.mode == Quit && c.pointer != Choice(Primary)
+			})],
+		),
+		(
+			false,
+			vec![(caps(keys.cancel), "Cancel", |c| {
+				c.mode == Quit && c.pointer != Choice(Secondary)
+			})],
+		),
 	]
 }
 
@@ -239,7 +336,7 @@ impl Hints {
 		// each version's keys as their width, label (none for the mouse), whether they have a cap and the codes that
 		// press them, then its description
 		let mut specs = Vec::new();
-		for row in row_specs(keys) {
+		for (crossfade, row) in row_specs(keys) {
 			let mut variants = Vec::new();
 			for (row_keys, text, when) in row {
 				let mut laid_out = Vec::new();
@@ -263,27 +360,28 @@ impl Hints {
 				}
 				variants.push((laid_out, text_layout(write, &text_format, text)?, when));
 			}
-			specs.push(variants);
+			specs.push((crossfade, variants));
 		}
 
 		// one key column and one text column for every version, so rows line up whichever show
 		let key_column = specs
 			.iter()
-			.flatten()
+			.flat_map(|(_, variants)| variants)
 			.map(|(keys, _, _)| {
 				keys.iter().map(|(width, ..)| width).sum::<f32>() + s(KEY_GAP) * (keys.len() as f32 - 1.0)
 			})
 			.fold(0.0, f32::max);
 		let text_column = specs
 			.iter()
-			.flatten()
+			.flat_map(|(_, variants)| variants)
 			.map(|(_, (_, width, _), _)| *width)
 			.fold(0.0, f32::max);
 		let left = s(MARGIN) + s(PADDING);
 		let text_x = left + key_column + s(TEXT_GAP);
 
 		let mut rows = Vec::new();
-		for row in specs {
+		for (crossfade, row) in specs {
+			let switch = if crossfade { fade } else { Duration::ZERO };
 			let mut variants = Vec::new();
 			for (row_keys, (text, _, text_height), when) in row {
 				let mut parts = Vec::new();
@@ -348,7 +446,7 @@ impl Hints {
 				variants.push(Variant {
 					parts,
 					when,
-					shown: Tween::new(target(when, context), fade, cubic_out),
+					shown: Tween::new(target(when, context), switch, cubic_out),
 					opacity: 0.0,
 				});
 			}
@@ -389,10 +487,14 @@ impl Hints {
 	pub fn update(&mut self, context: Context, held: impl Fn(u16) -> bool, now: Instant) {
 		let mut bottom = self.bottom; // of the next row up
 		for row in self.rows.iter_mut().rev() {
-			row.presence.retarget(row.target(context), now);
+			let showing = row.target(context);
+			row.presence.retarget(showing, now);
 			let presence = row.presence.value(now);
 			for variant in &mut row.variants {
-				variant.shown.retarget(target(variant.when, context), now);
+				// a leaving row fades out as it was
+				if showing > 0.0 {
+					variant.shown.retarget(target(variant.when, context), now);
+				}
 				variant.opacity = presence.min(variant.shown.value(now));
 				for part in &mut variant.parts {
 					part.held = part.codes.iter().any(|&code| held(code));
@@ -413,10 +515,12 @@ impl Hints {
 	// Whether rows are still fading or sliding, or about to start for `context`.
 	pub fn is_animating(&self, context: Context, now: Instant) -> bool {
 		self.rows.iter().any(|row| {
+			let showing = row.target(context);
 			!row.presence.is_done(now)
-				|| row.presence.target() != row.target(context)
+				|| row.presence.target() != showing
 				|| (row.variants.iter()).any(|variant| {
-					!variant.shown.is_done(now) || variant.shown.target() != target(variant.when, context)
+					!variant.shown.is_done(now)
+						|| (showing > 0.0 && variant.shown.target() != target(variant.when, context))
 				})
 		})
 	}

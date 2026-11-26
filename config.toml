@@ -1,9 +1,12 @@
 # snap settings, read each time the overlay opens.
 
-show_hints = true            # Show the control hints in the bottom-left corner. Each row only shows when it does something.
 hardware_acceleration = true # Draw the overlay on the GPU. Turn off to use Windows' software renderer instead.
-old_box_outline = true       # A dotted outline of the box from before a move or resize, fading out after.
-new_box_outline = false      # A dotted outline of where the box is going while it springs behind the mouse or a Ctrl/Shift change.
+
+[ui]
+hints = true            # The control hints in the bottom-left corner. Each row only shows when it does something.
+close_button = true     # The x in the screen's top-right corner. Shift+click it to quit snap.
+old_box_outline = true  # A dotted outline of the box from before a move or resize, fading out after.
+new_box_outline = false # A dotted outline of where the box is going while it springs behind the mouse or a Ctrl/Shift change.
 
 # Keybinds, written like "Ctrl+Shift+C": any of Ctrl, Shift, Alt and Win, then a letter, digit, F1 to F24, PrintScreen,
 # Escape, Enter, Space, Tab, Backspace, Delete, Insert, Home, End, PageUp, PageDown or Pause.
@@ -12,7 +15,11 @@ capture = "PrintScreen"    # Opens the overlay, from anywhere. Applies as soon a
 copy = "Ctrl+C"            # Copy the box, or the whole screen if there's no box.
 copy_whole = "PrintScreen" # Copy the whole screen.
 save = "Ctrl+S"            # Save the box (or the whole screen) as a PNG.
-close = "Escape"           # Clear the box, or close without copying if there's no box.
+close = "Escape"           # Close without copying.
+quit = "Shift+Escape"      # Quit snap, after asking. Same as Shift+clicking the x.
+confirm = "Enter"          # The primary answer of a confirmation, like Quit. The quit key does it too.
+cancel = "Escape"          # Clear the box, or a confirmation's other answer, like Cancel. Wins over close when both apply.
+alt_f4 = "quit"            # What Alt+F4 does: "disabled" (nothing), "ask" (the same as the quit key) or "quit" (quits snap without asking, as Windows does).
 
 [animations]
 enabled = true                 # Turns every animation below off at once when false.
