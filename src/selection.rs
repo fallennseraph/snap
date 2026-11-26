@@ -450,7 +450,8 @@ impl Selection {
 		self.drag = Drag::Idle;
 	}
 
-	fn clear(&mut self) {
+	// Removes the box. Not for mid-drag, where the drag would bring it back.
+	pub fn clear(&mut self) {
 		self.rect = None;
 		self.box_id = self.box_id.wrapping_add(1);
 	}
