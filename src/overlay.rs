@@ -16,8 +16,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-	GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RIGHT,
-	VK_SHIFT, VK_UP,
+	GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_LWIN,
+	VK_MENU, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
 	CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 	LoadCursorW, MB_ICONERROR, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SWP_SHOWWINDOW,
 	SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND,
 	WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-	WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+	WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use windows_numerics::Vector2;
@@ -34,22 +34,25 @@ use crate::anim::{Spring, Tween, cubic_out};
 use crate::buttons::{Button, Buttons};
 use crate::capture::{Image, capture_screen};
 use crate::clipboard::copy_image;
-use crate::config::{self, Animations};
+use crate::config::{self, Animations, Keys};
+use crate::confirm::{Choice, Confirm};
 use crate::gpu::{Gpu, Scene, text_format, text_layout};
-use crate::hints::Hints;
+use crate::hints::{Context, Hints, Pointer};
+use crate::keys::Chord;
 use crate::motion::{self, BoxMotion};
 use crate::render::{highlight, is_stacked, position_label, scaled, under_box};
 use crate::save::{ask_path, write_png};
 use crate::selection::{Grip, Hit, Modifiers, Point, Rect, Selection};
 use crate::tray;
 
-// Posted by the keyboard hook when PrtScr is pressed.
+// Posted by the keyboard hook when the capture key is pressed.
 pub const WM_SNAP_KEY: u32 = WM_APP + 1;
 
 // Sizes in pixels at 100% display scaling; they grow with the scaling.
 const HITSLOP_INSIDE: i32 = 10; // how far an edge's grab zone reaches into the box
 const HITSLOP_OUTSIDE: i32 = 20; // and out of it
 const LABEL_FONT_SIZE: i32 = 14;
+const LABEL_STROKE: i32 = 3; // the black stroke around the labels' text, half of it outside the glyphs
 const LABEL_GAP: i32 = 4; // between the box and its labels and buttons, and between a label and the buttons
 const HIGHLIGHT_THICKNESS: i32 = 2;
 const HIGHLIGHT_LENGTH: i32 = 12; // how far a corner highlight reaches along each edge
@@ -83,6 +86,7 @@ struct Shot {
 	old_box_outline: bool,
 	new_box_outline: bool,
 	animations: Animations,
+	keys: Keys,
 	label_format: IDWriteTextFormat,
 	hints: Option<Hints>,
 	hints_fade: Tween,
@@ -98,9 +102,10 @@ struct Shot {
 	old_boxes: Vec<(Rect, Tween)>, // dotted outlines of boxes before a drag, fading out
 	flash: Option<(Rect, Tween)>,
 	last_frame: Instant,
-	pacing: bool,  // the vsync thread is posting frames
-	saving: bool,  // the Save As dialog is open
-	closing: bool, // fading out; input is ignored
+	pacing: bool,             // the vsync thread is posting frames
+	saving: bool,             // the Save As dialog is open
+	closing: bool,            // fading out; input is ignored
+	confirm: Option<Confirm>, // asking whether to quit snap; kept while it fades out after an answer
 }
 
 thread_local! {
@@ -166,16 +171,24 @@ fn open(window: HWND) -> Result<()> {
 	let animations = config.animations.active();
 	let scale = unsafe { GetDpiForWindow(window) } as f32 / 96.0;
 
-	let (write, label_format, buttons) = with_gpu(|gpu| {
+	let (d2d, write, label_format, buttons) = with_gpu(|gpu| {
 		gpu.prepare(window, width, height, config.hardware_acceleration)?;
 		gpu.upload(&image)?;
 		Ok((
+			gpu.d2d.clone(),
 			gpu.write.clone(),
 			text_format(&gpu.write, scaled(LABEL_FONT_SIZE, scale) as f32)?,
 			Buttons::new(&gpu.d2d, scale)?,
 		))
 	})?;
-	let hints = match config.show_hints.then(|| Hints::new(&write, scale, height)) {
+	let start = Context {
+		has_box: false,
+		pointer: Pointer::Outside,
+	};
+	let hints = match config
+		.show_hints
+		.then(|| Hints::new(&d2d, &write, scale, height, &config.keys, start, animations.enabled))
+	{
 		Some(Err(err)) => {
 			eprintln!("snap: couldn't lay out the hints: {err}");
 			None
@@ -206,6 +219,7 @@ fn open(window: HWND) -> Result<()> {
 		old_box_outline: config.old_box_outline,
 		new_box_outline: config.new_box_outline,
 		animations,
+		keys: config.keys,
 		label_format,
 		hints,
 		hints_fade: Tween::new(1.0, HINT_FADE, cubic_out),
@@ -232,6 +246,7 @@ fn open(window: HWND) -> Result<()> {
 		pacing: false,
 		saving: false,
 		closing: false,
+		confirm: None,
 	};
 	// no fade when the overlay opens with the mouse already over the hints
 	shot.hints_fade = Tween::new(shot.hints_target(), HINT_FADE, cubic_out);
@@ -307,6 +322,113 @@ fn close(window: HWND, flash: Option<Rect>) {
 	} else {
 		hide(window);
 	}
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+	Copy,
+	CopyWhole,
+	Save,
+	Close,
+}
+
+impl Action {
+	// The action bound to `chord`, if any. A chord bound twice does the first of these.
+	fn for_chord(keys: &Keys, chord: Chord) -> Option<Self> {
+		[
+			(keys.close, Self::Close),
+			(keys.copy, Self::Copy),
+			(keys.save, Self::Save),
+			(keys.copy_whole, Self::CopyWhole),
+		]
+		.into_iter()
+		.find(|(bound, _)| *bound == chord)
+		.map(|(_, action)| action)
+	}
+
+	fn run(self, window: HWND) {
+		match self {
+			Self::Copy => copy(window, CopyMode::Selection),
+			Self::CopyWhole => copy(window, CopyMode::Whole),
+			Self::Save => save(window),
+			Self::Close => close_or_clear(window),
+		}
+	}
+}
+
+// Esc by default: clears the box if there is one (and it isn't being dragged), otherwise closes the overlay.
+fn close_or_clear(window: HWND) {
+	let cleared = with_shot(|shot| {
+		let clear = shot.selection.rect().is_some() && !shot.selection.is_dragging();
+		if clear {
+			shot.selection.clear();
+		}
+		clear
+	});
+	match cleared {
+		Some(true) => {
+			redraw(window);
+			keep_animating(window);
+		}
+		_ => close(window, None),
+	}
+}
+
+// Shows the confirmation for quitting snap.
+fn ask_to_quit(window: HWND) {
+	let Some((scale, screen, animate)) = with_shot(|shot| {
+		(
+			shot.scale,
+			(shot.image.width, shot.image.height),
+			shot.animations.enabled,
+		)
+	}) else {
+		return;
+	};
+	let confirm = with_gpu(|gpu| {
+		Confirm::new(
+			&gpu.d2d,
+			&gpu.write,
+			scale,
+			screen,
+			"Quit snap?",
+			"Quit",
+			"Cancel",
+			animate,
+		)
+	});
+	match confirm {
+		Ok(confirm) => {
+			with_shot(|shot| {
+				shot.pressed = None;
+				shot.confirm = Some(confirm);
+			});
+		}
+		Err(err) => eprintln!("snap: couldn't show the quit confirmation: {err}"),
+	}
+	redraw(window);
+	keep_animating(window);
+}
+
+// Answers the quit confirmation: quits snap, or fades the confirmation out.
+fn answer(window: HWND, choice: Choice) {
+	if choice == Choice::Primary {
+		let _ = unsafe { DestroyWindow(window) };
+		return;
+	}
+	with_shot(|shot| {
+		if let Some(confirm) = shot.active_confirm() {
+			confirm.answer(Instant::now());
+		}
+	});
+	redraw(window);
+	keep_animating(window);
+}
+
+// What a click picked: a button, or an answer to the confirmation.
+enum Click {
+	Button(Button),
+	Choice(Choice),
 }
 
 #[derive(Clone, Copy)]
@@ -477,6 +599,13 @@ impl Shot {
 			dotted.push((target, 1.0));
 		}
 
+		let context = self.hint_context();
+		if let Some(hints) = &mut self.hints {
+			hints.update(context, |code| key_down(VIRTUAL_KEY(code)), now);
+		}
+		if self.confirm.as_ref().is_some_and(|confirm| confirm.is_gone(now)) {
+			self.confirm = None;
+		}
 		let ui = self.fade.value(now);
 		let scene = Scene {
 			dim: ui,
@@ -484,23 +613,63 @@ impl Shot {
 			selection: drawn,
 			highlight: &highlight,
 			labels: &labels,
+			label_stroke: scaled(LABEL_STROKE, self.scale) as f32,
 			dotted: &dotted,
 			flash: self.flash.map(|(rect, flash)| (rect, flash.value(now))),
 			hints: self.hints.as_ref().map(|hints| (hints, self.hints_fade.value(now))),
 			buttons,
+			close: (
+				&self.buttons,
+				self.buttons.close_rect(self.image.width),
+				hovered == Some(Button::Close),
+			),
+			confirm: (self.confirm.as_ref()).map(|confirm| (confirm, confirm.hit(self.hover), now)),
 		};
 		gpu.prepare(window, self.image.width, self.image.height, self.hardware)?;
 		gpu.upload(&self.image)?;
 		gpu.draw(&scene)
 	}
 
-	// The button under `p`, where the buttons were last drawn, so they work where they show while the box springs.
-	// They don't take clicks while there's no box (fading out) or it's being dragged.
+	// The button under `p`. The box's buttons are where they were last drawn, so they work where they show while the
+	// box springs, and take no clicks while there's no box (fading out). No button takes clicks mid-drag or while the
+	// confirmation is up.
 	fn button_at(&self, p: Point) -> Option<Button> {
-		if self.selection.is_dragging() || self.selection.rect().is_none() {
+		if self.selection.is_dragging() || self.is_confirming() {
 			return None;
 		}
+		if self.buttons.close_rect(self.image.width).contains(p) {
+			return Some(Button::Close);
+		}
+		self.selection.rect()?;
 		self.buttons.hit(self.row?, p)
+	}
+
+	// The confirmation, while it's up and unanswered.
+	fn active_confirm(&mut self) -> Option<&mut Confirm> {
+		self.confirm.as_mut().filter(|confirm| !confirm.is_answered())
+	}
+
+	fn is_confirming(&self) -> bool {
+		self.confirm.as_ref().is_some_and(|confirm| !confirm.is_answered())
+	}
+
+	// What the hints should describe: whether there's a box, and what the mouse would act on.
+	fn hint_context(&self) -> Context {
+		let pointer = match self.pressed.or(self.button_at(self.hover)) {
+			Some(Button::Copy) => Pointer::Copy,
+			Some(Button::Save) => Pointer::Save,
+			Some(Button::Clear) => Pointer::Clear,
+			Some(Button::Close) => Pointer::Close,
+			None => match self.selection.active_hit(self.hover) {
+				Hit::Outside => Pointer::Outside,
+				Hit::Move => Pointer::Move,
+				Hit::Resize(_) => Pointer::Resize,
+			},
+		};
+		Context {
+			has_box: self.selection.rect().is_some(),
+			pointer,
+		}
 	}
 
 	// Fully shown, or hidden while the mouse is over them.
@@ -515,6 +684,8 @@ impl Shot {
 	fn is_animating(&self, now: Instant) -> bool {
 		!self.fade.is_done(now)
 			|| !self.hints_fade.is_done(now)
+			|| (self.hints.as_ref()).is_some_and(|hints| hints.is_animating(self.hint_context(), now))
+			|| (self.confirm.as_ref()).is_some_and(|confirm| confirm.is_animating(now))
 			|| !self.old_boxes.is_empty()
 			|| self.flash.is_some()
 			|| !self.motion.is_settled(self.selection.rect())
@@ -662,6 +833,7 @@ fn set_cursor() -> bool {
 		y: cursor.y,
 	};
 	let name = with_shot(|shot| match shot.pressed.or(shot.button_at(hover)) {
+		_ if shot.is_confirming() => IDC_ARROW,
 		Some(_) => IDC_ARROW,
 		None => cursor_for(shot.selection.active_hit(hover)),
 	});
@@ -695,14 +867,26 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 	match msg {
 		WM_SNAP_KEY => {
 			match with_shot(|shot| (shot.saving, shot.closing)) {
-				// PrtScr does nothing while the Save As dialog is open
+				// the capture key does nothing while the Save As dialog is open
 				Some((true, _)) => {}
 				// a fresh capture right away, skipping the rest of the fade-out
 				Some((_, true)) => {
 					hide(window);
 					open_or_report(window);
 				}
-				Some(_) => copy(window, CopyMode::Whole),
+				// the capture key does whatever it's also bound to in the overlay (copying the whole screen by default),
+				// and nothing while the confirmation is up
+				Some(_) => {
+					let action = with_shot(|shot| {
+						(!shot.is_confirming())
+							.then(|| Action::for_chord(&shot.keys, shot.keys.capture))
+							.flatten()
+					})
+					.flatten();
+					if let Some(action) = action {
+						action.run(window);
+					}
+				}
 				None => open_or_report(window),
 			}
 			LRESULT(0)
@@ -742,6 +926,10 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			let p = point_from(lparam);
 			with_shot(|shot| {
 				shot.hover = p;
+				if let Some(confirm) = shot.active_confirm() {
+					confirm.pressed = confirm.hit(p);
+					return;
+				}
 				shot.pressed = shot.button_at(p);
 				if shot.pressed.is_none() {
 					shot.selection.set_modifiers(held_modifiers());
@@ -754,6 +942,13 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 		WM_MOUSEMOVE if is_interactive() => {
 			let p = point_from(lparam);
 			let changed = with_shot(|shot| {
+				if let Some(confirm) = &shot.confirm
+					&& !confirm.is_answered()
+				{
+					let changed = confirm.hit(shot.hover) != confirm.hit(p);
+					shot.hover = p;
+					return changed;
+				}
 				let state = |shot: &Shot, p| (shot.selection.rect(), shot.selection.highlight(p), shot.button_at(p));
 				let before = state(shot, shot.hover);
 				shot.hover = p;
@@ -775,8 +970,14 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			let p = point_from(lparam);
 			let clicked = with_shot(|shot| {
 				shot.hover = p;
+				if let Some(confirm) = shot.active_confirm() {
+					let pressed = confirm.pressed.take();
+					return pressed
+						.filter(|&choice| confirm.hit(p) == Some(choice))
+						.map(Click::Choice);
+				}
 				match shot.pressed.take() {
-					Some(pressed) => (shot.button_at(p) == Some(pressed)).then_some(pressed),
+					Some(pressed) => (shot.button_at(p) == Some(pressed)).then_some(Click::Button(pressed)),
 					None => {
 						shot.release(p);
 						None
@@ -785,9 +986,15 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			});
 			let _ = unsafe { ReleaseCapture() };
 			match clicked.flatten() {
-				Some(Button::Copy) => copy(window, CopyMode::Selection),
-				Some(Button::Save) => save(window),
-				Some(Button::Close) => close(window, None),
+				Some(Click::Button(Button::Copy)) => copy(window, CopyMode::Selection),
+				Some(Click::Button(Button::Save)) => save(window),
+				Some(Click::Button(Button::Clear)) => {
+					with_shot(|shot| shot.selection.clear());
+				}
+				// Shift+click quits snap, after asking
+				Some(Click::Button(Button::Close)) if key_down(VK_SHIFT) => ask_to_quit(window),
+				Some(Click::Button(Button::Close)) => close(window, None),
+				Some(Click::Choice(choice)) => answer(window, choice),
 				None => {}
 			}
 			redraw(window);
@@ -798,6 +1005,9 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 		WM_CAPTURECHANGED => {
 			with_shot(|shot| {
 				shot.pressed = None;
+				if let Some(confirm) = shot.active_confirm() {
+					confirm.pressed = None;
+				}
 				if shot.selection.is_dragging() {
 					shot.release(shot.hover);
 				}
@@ -815,35 +1025,64 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 		// Quit from the tray, or a newer copy closed this one (WM_CLOSE destroys the window by default)
 		WM_DESTROY => {
 			tray::remove(window);
+			// released here, while the window still exists: left to the thread-local's destructor at process exit,
+			// releasing the Direct2D objects made the process exit with code 2170 (0x87A, the DXGI facility)
+			GPU.with_borrow_mut(|gpu| *gpu = None);
 			unsafe { PostQuitMessage(0) };
 			LRESULT(0)
 		}
+		// redrawn for the hints, which light up held keys
 		WM_KEYUP if is_interactive() => {
 			update_modifiers(window);
+			redraw(window);
 			LRESULT(0)
 		}
-		WM_KEYDOWN if is_interactive() => {
-			update_modifiers(window);
+		WM_SYSKEYUP if is_interactive() => {
+			redraw(window);
+			unsafe { DefWindowProcW(window, msg, wparam, lparam) }
+		}
+		// with Alt held (or for F10) keys come as WM_SYSKEYDOWN, which goes on to Windows unless it's a keybind
+		WM_KEYDOWN | WM_SYSKEYDOWN if is_interactive() => {
 			let key = wparam.0 as u16;
-			let ctrl = key_down(VK_CONTROL);
-			if key == VK_ESCAPE.0 {
-				close(window, None);
-			} else if ctrl && key == u16::from(b'C') {
-				copy(window, CopyMode::Selection);
-			} else if ctrl && key == u16::from(b'S') {
-				save(window);
-			} else {
-				let (dx, dy) = match key {
-					k if k == VK_LEFT.0 => (-1, 0),
-					k if k == VK_RIGHT.0 => (1, 0),
-					k if k == VK_UP.0 => (0, -1),
-					k if k == VK_DOWN.0 => (0, 1),
-					_ => return LRESULT(0),
-				};
-				with_shot(|shot| shot.selection.nudge(dx, dy));
-				redraw(window);
-				keep_animating(window);
+			redraw(window); // for the hints, which light up held keys
+			// the confirmation takes only Enter and Esc
+			if with_shot(|shot| shot.is_confirming()) == Some(true) {
+				match key {
+					k if k == VK_RETURN.0 => answer(window, Choice::Primary),
+					k if k == VK_ESCAPE.0 => answer(window, Choice::Secondary),
+					_ => {}
+				}
+				return LRESULT(0);
 			}
+			update_modifiers(window);
+			let [ctrl, shift, alt, win] = [
+				key_down(VK_CONTROL),
+				key_down(VK_SHIFT),
+				key_down(VK_MENU),
+				key_down(VK_LWIN) || key_down(VK_RWIN),
+			];
+			let chord = Chord {
+				ctrl,
+				shift,
+				alt,
+				win,
+				key,
+			};
+			if let Some(action) = with_shot(|shot| Action::for_chord(&shot.keys, chord)).flatten() {
+				action.run(window);
+				return LRESULT(0);
+			}
+			let (dx, dy) = match key {
+				k if k == VK_LEFT.0 => (-1, 0),
+				k if k == VK_RIGHT.0 => (1, 0),
+				k if k == VK_UP.0 => (0, -1),
+				k if k == VK_DOWN.0 => (0, 1),
+				_ if msg == WM_SYSKEYDOWN => return unsafe { DefWindowProcW(window, msg, wparam, lparam) },
+				_ => return LRESULT(0),
+			};
+			with_shot(|shot| shot.selection.nudge(dx, dy));
+			redraw(window);
+			keep_animating(window);
 			LRESULT(0)
 		}
 		// input while closing is ignored

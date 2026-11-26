@@ -3,28 +3,38 @@
 // Drawing the overlay with Direct2D (on the GPU unless hardware acceleration is off) and its text with DirectWrite.
 // The screenshot is uploaded once when the overlay opens; each frame is then a handful of draw calls.
 
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::rc::Rc;
+use std::time::Instant;
+
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
 	D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-	D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES,
-	D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_CUSTOM, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-	D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINE_JOIN_MITER, D2D1_PRESENT_OPTIONS_NONE,
-	D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-	D2D1_RENDER_TARGET_USAGE_NONE, D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory,
-	ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+	D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+	D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_CUSTOM,
+	D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+	D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_MITER, D2D1_LINE_JOIN_ROUND,
+	D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+	D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_STROKE_STYLE_PROPERTIES,
+	D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1Geometry,
+	ID2D1HwndRenderTarget, ID2D1Layer, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
 	DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
-	DWRITE_TEXT_METRICS, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+	DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_STRIKETHROUGH,
+	DWRITE_TEXT_METRICS, DWRITE_UNDERLINE, DWriteCreateFactory, IDWriteFactory, IDWriteInlineObject,
+	IDWritePixelSnapping_Impl, IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::core::{Result, w};
-use windows_numerics::Vector2;
+use windows::core::{BOOL, IUnknown, Ref, Result, implement, w};
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::buttons::{Button, Buttons};
 use crate::capture::Image;
+use crate::confirm::{Choice, Confirm};
 use crate::hints::Hints;
 use crate::render::{around, outline};
 use crate::selection::Rect;
@@ -41,18 +51,23 @@ pub struct Scene<'a> {
 	pub selection: Option<Rect>,
 	pub highlight: &'a [Rect],
 	pub labels: &'a [(Vector2, IDWriteTextLayout)],
+	pub label_stroke: f32, // the width of the black stroke around the labels' text, half of it outside the glyphs
 	pub dotted: &'a [(Rect, f32)], // outlines with their opacity
 	pub flash: Option<(Rect, f32)>,
 	pub hints: Option<(&'a Hints, f32)>,
 	// the row, where it goes, the hovered button and its opacity
 	pub buttons: Option<(&'a Buttons, Rect, Option<Button>, f32)>,
+	pub close: (&'a Buttons, Rect, bool), // the close button in the top-right corner, and whether it's hovered
+	pub confirm: Option<(&'a Confirm, Option<Choice>, Instant)>, // with its hovered button, and the time to draw it at
 }
 
 // Brushes and the dash style for one render target.
 pub struct Paint {
 	pub white: ID2D1SolidColorBrush,
-	black: ID2D1SolidColorBrush,
+	pub black: ID2D1SolidColorBrush,
 	dashes: ID2D1StrokeStyle,
+	pub round: ID2D1StrokeStyle, // round joins and caps, for the black strokes under white shapes
+	layer: ID2D1Layer,           // reused by `with_opacity`
 }
 
 struct Target {
@@ -166,6 +181,27 @@ impl Gpu {
 }
 
 impl Paint {
+	// Draws what `draw` draws as one image faded to `opacity`, so a white shape at less than full opacity doesn't let
+	// its black stroke show through. Only `bounds` (in the current transform) is kept.
+	pub fn with_opacity(
+		&self,
+		render_target: &ID2D1RenderTarget,
+		bounds: D2D_RECT_F,
+		opacity: f32,
+		draw: impl FnOnce(),
+	) {
+		let parameters = D2D1_LAYER_PARAMETERS {
+			contentBounds: bounds,
+			maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+			maskTransform: Matrix3x2::identity(),
+			opacity,
+			..Default::default()
+		};
+		unsafe { render_target.PushLayer(&parameters, &self.layer) };
+		draw();
+		unsafe { render_target.PopLayer() };
+	}
+
 	pub fn new(d2d: &ID2D1Factory, render_target: &ID2D1RenderTarget) -> Result<Self> {
 		unsafe {
 			let white = D2D1_COLOR_F {
@@ -191,9 +227,19 @@ impl Paint {
 			};
 			Ok(Self {
 				white: render_target.CreateSolidColorBrush(&white, None)?,
+				layer: render_target.CreateLayer(None)?,
 				black: render_target.CreateSolidColorBrush(&black, None)?,
 				// dash lengths are in stroke widths, and the outlines are 1 px wide
 				dashes: d2d.CreateStrokeStyle(&stroke, Some(&[DASH, DASH]))?,
+				round: d2d.CreateStrokeStyle(
+					&D2D1_STROKE_STYLE_PROPERTIES {
+						startCap: D2D1_CAP_STYLE_ROUND,
+						endCap: D2D1_CAP_STYLE_ROUND,
+						lineJoin: D2D1_LINE_JOIN_ROUND,
+						..Default::default()
+					},
+					None,
+				)?,
 			})
 		}
 	}
@@ -254,12 +300,24 @@ pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: 
 
 		paint.white.SetOpacity(scene.ui);
 		if let Some(rect) = scene.selection {
+			// a black line just outside the white one, so the outline shows on white too
+			paint.black.SetOpacity(scene.ui);
+			let around_outline = Rect {
+				left: rect.left - 1,
+				top: rect.top - 1,
+				right: rect.right + 1,
+				bottom: rect.bottom + 1,
+			};
+			for strip in outline(around_outline) {
+				render_target.FillRectangle(&rect_f(strip), &paint.black);
+			}
 			for strip in outline(rect).iter().chain(scene.highlight) {
 				render_target.FillRectangle(&rect_f(*strip), &paint.white);
 			}
 		}
+		paint.white.SetOpacity(1.0);
+		paint.black.SetOpacity(1.0);
 		for (rect, opacity) in scene.dotted {
-			paint.white.SetOpacity(DOTTED_OPACITY * opacity * scene.ui);
 			// centered on the pixels just outside the box, where the solid outline goes
 			let line = D2D_RECT_F {
 				left: rect.left as f32 - 0.5,
@@ -267,24 +325,170 @@ pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: 
 				right: rect.right as f32 + 0.5,
 				bottom: rect.bottom as f32 + 0.5,
 			};
-			render_target.DrawRectangle(&line, &paint.white, 1.0, &paint.dashes);
+			let bounds = D2D_RECT_F {
+				left: line.left - 1.0,
+				top: line.top - 1.0,
+				right: line.right + 1.0,
+				bottom: line.bottom + 1.0,
+			};
+			// white dashes over a solid black line, so the gaps are black and it shows on white too
+			paint.with_opacity(render_target, bounds, DOTTED_OPACITY * opacity * scene.ui, || {
+				render_target.DrawRectangle(&line, &paint.black, 1.0, None);
+				render_target.DrawRectangle(&line, &paint.white, 1.0, &paint.dashes);
+			});
 		}
 		paint.white.SetOpacity(scene.ui);
+		paint.black.SetOpacity(scene.ui);
+		let factory = render_target.GetFactory();
 		for (origin, layout) in scene.labels {
+			// a round black stroke under the text keeps it readable over the bright box (skipped if it can't be made)
+			if let Ok(factory) = &factory
+				&& let Ok(outlines) = text_outlines(factory, layout, *origin)
+			{
+				render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+				for outline in outlines {
+					render_target.DrawGeometry(&outline, &paint.black, scene.label_stroke, &paint.round);
+				}
+				render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+			}
 			render_target.DrawTextLayout(*origin, layout, &paint.white, D2D1_DRAW_TEXT_OPTIONS_NONE);
 		}
 		if let Some((buttons, row, hovered, opacity)) = scene.buttons {
-			buttons.draw(render_target, &paint.white, row, hovered, opacity * scene.ui);
+			buttons.draw(render_target, paint, row, hovered, opacity * scene.ui);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
+		let (buttons, close, hovered) = scene.close;
+		buttons.draw_one(render_target, paint, Button::Close, close, hovered, scene.ui);
+		render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		if let Some((hints, opacity)) = scene.hints {
-			hints.draw(render_target, &paint.white, opacity * scene.ui);
+			hints.draw(render_target, paint, opacity * scene.ui);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
 		if let Some((rect, opacity)) = scene.flash {
 			paint.white.SetOpacity(FLASH_OPACITY * opacity);
 			render_target.FillRectangle(&rect_f(rect), &paint.white);
 		}
+		if let Some((confirm, hovered, now)) = scene.confirm {
+			confirm.draw(render_target, paint, scene.ui, hovered, now);
+			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+		}
+	}
+}
+
+// The outlines of the glyphs `layout` draws at `origin`, one geometry per glyph run.
+pub fn text_outlines(d2d: &ID2D1Factory, layout: &IDWriteTextLayout, origin: Vector2) -> Result<Vec<ID2D1Geometry>> {
+	let outlines = Rc::new(RefCell::new(Vec::new()));
+	let collector: IDWriteTextRenderer = OutlineCollector {
+		d2d: d2d.clone(),
+		outlines: outlines.clone(),
+	}
+	.into();
+	unsafe { layout.Draw(None, &collector, origin.X, origin.Y)? };
+	Ok(outlines.take())
+}
+
+// A text renderer that draws nothing, only turning each glyph run into a geometry. DirectWrite has no way to stroke
+// text, so this is how the glyph shapes are reached.
+#[implement(IDWriteTextRenderer)]
+struct OutlineCollector {
+	d2d: ID2D1Factory,
+	outlines: Rc<RefCell<Vec<ID2D1Geometry>>>,
+}
+
+// pixel snapping and one pixel per DIP, as `DrawTextLayout` does on the overlay's 96 DPI target, so the outlines line
+// up with the text drawn over them
+impl IDWritePixelSnapping_Impl for OutlineCollector_Impl {
+	fn IsPixelSnappingDisabled(&self, _context: *const c_void) -> Result<BOOL> {
+		Ok(false.into())
+	}
+
+	fn GetCurrentTransform(&self, _context: *const c_void, transform: *mut DWRITE_MATRIX) -> Result<()> {
+		let identity = DWRITE_MATRIX {
+			m11: 1.0,
+			m22: 1.0,
+			..Default::default()
+		};
+		unsafe { transform.write(identity) };
+		Ok(())
+	}
+
+	fn GetPixelsPerDip(&self, _context: *const c_void) -> Result<f32> {
+		Ok(1.0)
+	}
+}
+
+impl IDWriteTextRenderer_Impl for OutlineCollector_Impl {
+	fn DrawGlyphRun(
+		&self,
+		_context: *const c_void,
+		x: f32,
+		y: f32,
+		_mode: DWRITE_MEASURING_MODE,
+		run: *const DWRITE_GLYPH_RUN,
+		_description: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+		_effect: Ref<IUnknown>,
+	) -> Result<()> {
+		unsafe {
+			let run = &*run;
+			let Some(face) = run.fontFace.as_ref() else {
+				return Ok(());
+			};
+			let path = self.d2d.CreatePathGeometry()?;
+			let sink = path.Open()?;
+			// in run space, with the baseline origin at 0, 0
+			face.GetGlyphRunOutline(
+				run.fontEmSize,
+				run.glyphIndices,
+				Some(run.glyphAdvances),
+				Some(run.glyphOffsets),
+				run.glyphCount,
+				run.isSideways.as_bool(),
+				run.bidiLevel % 2 == 1,
+				&sink,
+			)?;
+			sink.Close()?;
+			let placed = self
+				.d2d
+				.CreateTransformedGeometry(&path, &Matrix3x2::translation(x, y))?;
+			self.outlines.borrow_mut().push(placed.into());
+		}
+		Ok(())
+	}
+
+	// the labels have no underlines, strikethroughs or inline objects
+	fn DrawUnderline(
+		&self,
+		_: *const c_void,
+		_: f32,
+		_: f32,
+		_: *const DWRITE_UNDERLINE,
+		_: Ref<IUnknown>,
+	) -> Result<()> {
+		Ok(())
+	}
+
+	fn DrawStrikethrough(
+		&self,
+		_: *const c_void,
+		_: f32,
+		_: f32,
+		_: *const DWRITE_STRIKETHROUGH,
+		_: Ref<IUnknown>,
+	) -> Result<()> {
+		Ok(())
+	}
+
+	fn DrawInlineObject(
+		&self,
+		_: *const c_void,
+		_: f32,
+		_: f32,
+		_: Ref<IDWriteInlineObject>,
+		_: BOOL,
+		_: BOOL,
+		_: Ref<IUnknown>,
+	) -> Result<()> {
+		Ok(())
 	}
 }
 
