@@ -36,6 +36,11 @@ impl Tween {
 		self.from + (self.to - self.from) * (self.ease)(self.progress(now))
 	}
 
+	// Where it's heading (or resting).
+	pub fn target(&self) -> f32 {
+		self.to
+	}
+
 	pub fn is_done(&self, now: Instant) -> bool {
 		self.from == self.to || self.progress(now) >= 1.0
 	}
