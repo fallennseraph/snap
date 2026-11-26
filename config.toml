@@ -1,27 +1,23 @@
 # snap settings, read each time the overlay opens.
 
-# Show the control hints in the bottom-left corner.
-show_hints = true
+show_hints = true            # Show the control hints in the bottom-left corner. Each row only shows when it does something.
+hardware_acceleration = true # Draw the overlay on the GPU. Turn off to use Windows' software renderer instead.
+old_box_outline = true       # A dotted outline of the box from before a move or resize, fading out after.
+new_box_outline = false      # A dotted outline of where the box is going while it springs behind the mouse or a Ctrl/Shift change.
 
-# Draw the overlay on the GPU. Turn off to use Windows' software renderer instead.
-hardware_acceleration = true
-
-# A dotted outline of the box from before a move or resize, fading out after.
-old_box_outline = true
-
-# A dotted outline of where the box is going while it springs behind the mouse or a Ctrl/Shift change.
-new_box_outline = false
+# Keybinds, written like "Ctrl+Shift+C": any of Ctrl, Shift, Alt and Win, then a letter, digit, F1 to F24, PrintScreen,
+# Escape, Enter, Space, Tab, Backspace, Delete, Insert, Home, End, PageUp, PageDown or Pause.
+[keys]
+capture = "PrintScreen"    # Opens the overlay, from anywhere. Applies as soon as this file is saved. In the overlay it does whatever it's also bound to below.
+copy = "Ctrl+C"            # Copy the box, or the whole screen if there's no box.
+copy_whole = "PrintScreen" # Copy the whole screen.
+save = "Ctrl+S"            # Save the box (or the whole screen) as a PNG.
+close = "Escape"           # Clear the box, or close without copying if there's no box.
 
 [animations]
-# Turns every animation below off at once when false.
-enabled = true
-# The overlay fades in when it opens and out when it closes.
-overlay_fade = true
-# The box springs to its new shape when Ctrl or Shift is pressed or released mid-drag.
-modifier_spring = true
-# The box springs after the mouse during fast drags.
-drag_spring = true
-# A white flash in the box when copying it.
-copy_flash = true
-# The same flash over the whole screen when copying all of it.
-copy_flash_full_screen = false
+enabled = true                 # Turns every animation below off at once when false.
+overlay_fade = true            # The overlay fades in when it opens and out when it closes.
+modifier_spring = true         # The box springs to its new shape when Ctrl or Shift is pressed or released mid-drag.
+drag_spring = true             # The box springs after the mouse during fast drags.
+copy_flash = true              # A white flash in the box when copying it.
+copy_flash_full_screen = false # The same flash over the whole screen when copying all of it.

@@ -1,6 +1,6 @@
 // main
 
-// snap: a lightweight screenshot tool. Runs in the background; PrtScr opens the overlay.
+// snap: a lightweight screenshot tool. Runs in the background; the capture key (PrtScr by default) opens the overlay.
 
 // release builds have no console window; debug builds keep one for error output
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -10,10 +10,12 @@ mod buttons;
 mod capture;
 mod clipboard;
 mod config;
+mod confirm;
 mod gdi;
 mod gpu;
 mod hints;
 mod hook;
+mod keys;
 mod motion;
 mod overlay;
 mod render;
@@ -36,7 +38,7 @@ const TAKE_OVER_TRIES: u32 = 50;
 const TAKE_OVER_WAIT_MS: u32 = 100;
 
 fn main() -> Result<()> {
-	// One copy runs at a time, so only one hook takes PrtScr. The newest copy wins, so starting an updated build
+	// One copy runs at a time, so only one hook takes the capture key. The newest copy wins, so starting an updated build
 	// replaces the old one. Each copy owns the mutex until it exits.
 	let instance = unsafe { CreateMutexW(None, true, w!("Local\\snap.instance"))? };
 	if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS && !take_over(instance) {
@@ -49,7 +51,9 @@ fn main() -> Result<()> {
 		SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
 	}
 	let window = overlay::create()?;
-	let _hook = hook::install(window, overlay::WM_SNAP_KEY)?;
+	let _hook = hook::install(window, overlay::WM_SNAP_KEY, config::load().keys.capture)?;
+	// the rest of the config is read when the overlay opens
+	config::watch(|config| hook::set_capture(config.keys.capture));
 	// PrtScr still works without the icon (for example before Explorer has started); it's added when the
 	// taskbar appears
 	if let Err(err) = tray::add(window) {
