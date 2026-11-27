@@ -22,6 +22,7 @@ mod render;
 mod save;
 mod selection;
 mod settings;
+mod startup;
 mod tray;
 
 use windows::Win32::Foundation::{
@@ -55,8 +56,12 @@ fn main() -> Result<()> {
 	config::init();
 	let config = config::load();
 	let _hook = hook::install(window, overlay::WM_SNAP_KEY, config.keys.capture)?;
-	// the rest of the config is read when the overlay opens
-	config::watch(|config| hook::set_capture(config.keys.capture));
+	set_startup(config.start_with_windows);
+	// these two apply as soon as config.toml is saved; the rest is read when the overlay opens
+	config::watch(|config| {
+		hook::set_capture(config.keys.capture);
+		set_startup(config.start_with_windows);
+	});
 	// PrtScr still works without the icon (for example before Explorer has started); it's added when the
 	// taskbar appears
 	if let Err(err) = tray::add(window) {
@@ -71,6 +76,16 @@ fn main() -> Result<()> {
 		}
 	}
 	Ok(())
+}
+
+// Turns starting with Windows on or off, which only fails if the registry refuses.
+fn set_startup(on: bool) {
+	if let Err(err) = startup::set(on) {
+		eprintln!(
+			"snap: couldn't turn starting with Windows {}: {err}",
+			if on { "on" } else { "off" }
+		);
+	}
 }
 
 // Asks the running copy to close and waits until it has, taking over `mutex`. `false` if it doesn't close in time.

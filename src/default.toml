@@ -2,6 +2,8 @@
 # menu) writes here too, keeping these comments.
 
 hardware_acceleration = true # Draw the overlay on the GPU. Turn off to use Windows' software renderer instead.
+start_with_windows = false   # Start snap when signing in to Windows.
+capture_cursor = false       # Include the mouse cursor in screenshots.
 
 [ui]
 hints = true            # The control hints in the bottom-left corner. Each row only shows when it does something.

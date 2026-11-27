@@ -36,8 +36,10 @@ pub enum Target {
 type Field<T, F> = fn(&mut T) -> &mut F;
 
 // The on/off settings in the order they show, under `General`, `UI` and `Animations`.
-const SWITCHES: [(&str, Field<Config, bool>); 11] = [
+const SWITCHES: [(&str, Field<Config, bool>); 13] = [
 	("Hardware acceleration", |c| &mut c.hardware_acceleration),
+	("Start with Windows", |c| &mut c.start_with_windows),
+	("Mouse cursor in screenshots", |c| &mut c.capture_cursor),
 	("Hints", |c| &mut c.ui.hints),
 	("Close and settings buttons", |c| &mut c.ui.close_button),
 	("Old box outline while dragging", |c| &mut c.ui.old_box_outline),
@@ -51,8 +53,8 @@ const SWITCHES: [(&str, Field<Config, bool>); 11] = [
 		&mut c.animations.copy_flash_full_screen
 	}),
 ];
-const UI_START: usize = 1;
-const ANIMATIONS_START: usize = 5; // `Animations` itself, which the ones after it need
+const UI_START: usize = 3;
+const ANIMATIONS_START: usize = 7; // `Animations` itself, which the ones after it need
 
 // The keybinds in the order they show, with their names in `Keys::conflicts`.
 const BINDS: [(&str, &str, Field<Keys, Chord>); 10] = [

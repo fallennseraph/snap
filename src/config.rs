@@ -23,6 +23,8 @@ const DEFAULT: &str = include_str!("default.toml");
 #[serde(default)]
 pub struct Config {
 	pub hardware_acceleration: bool, // default: true; off draws with Windows' software renderer
+	pub start_with_windows: bool,    // default: false
+	pub capture_cursor: bool,        // default: false; draws the mouse cursor into screenshots
 	pub ui: Ui,
 	pub animations: Animations,
 	pub keys: Keys,
@@ -32,6 +34,8 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			hardware_acceleration: true,
+			start_with_windows: false,
+			capture_cursor: false,
 			ui: Ui::default(),
 			animations: Animations::default(),
 			keys: Keys::default(),
@@ -245,6 +249,8 @@ fn update(text: &str, config: &Config) -> String {
 	});
 	let root = document.as_table_mut();
 	set(root, "hardware_acceleration", config.hardware_acceleration.into());
+	set(root, "start_with_windows", config.start_with_windows.into());
+	set(root, "capture_cursor", config.capture_cursor.into());
 
 	let Ui {
 		hints,

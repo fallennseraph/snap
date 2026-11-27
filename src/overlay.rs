@@ -198,7 +198,7 @@ fn open(window: HWND, live: bool) -> Result<()> {
 			pixels: Vec::new(),
 		}
 	} else {
-		capture_screen()?
+		capture_screen(config.capture_cursor)?
 	};
 	let (width, height) = (image.width, image.height);
 	let animations = config.animations.active();
