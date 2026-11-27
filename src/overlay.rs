@@ -1,52 +1,62 @@
 // overlay
 
-// The full-screen window that shows the frozen screenshot and lets the user draw a box on it.
+// The full-screen window that shows the frozen screenshot and lets the user draw a box on it. Opened from the tray's
+// Settings, it shows the settings menu over the live screen instead, with no screenshot.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Direct2D::ID2D1Factory;
+use windows::Win32::Graphics::DirectWrite::{IDWriteFactory, IDWriteTextFormat};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, UpdateWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-	GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_F4, VK_LEFT, VK_LWIN,
-	VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
+	GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F4, VK_LEFT,
+	VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-	CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-	HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-	LoadCursorW, MB_ICONERROR, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SC_CLOSE, SW_HIDE,
-	SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CAPTURECHANGED, WM_DESTROY,
-	WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP,
-	WM_SETCURSOR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+	CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+	GetWindowLongPtrW, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
+	IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, LWA_ALPHA, LoadCursorW, MB_ICONERROR, MessageBoxW,
+	PostMessageW, PostQuitMessage, RegisterClassExW, SC_CLOSE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SWP_SHOWWINDOW,
+	SetCursor, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP,
+	WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+	WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW,
+	WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
 use windows_numerics::Vector2;
 
 use crate::anim::{Spring, Tween, cubic_out};
-use crate::buttons::{Button, Buttons};
+use crate::buttons::{Button, Buttons, History};
 use crate::capture::{Image, capture_screen};
 use crate::clipboard::copy_image;
-use crate::config::{self, AltF4, Animations, Keys};
+use crate::config::{self, AltF4, Animations, Config, Keys};
 use crate::confirm::{Choice, Confirm};
 use crate::gpu::{Gpu, Scene, text_format, text_layout};
 use crate::hints::{Context, Hints, Mode, Pointer};
+use crate::hook;
 use crate::keys::Chord;
 use crate::motion::{self, BoxMotion};
 use crate::render::{highlight, is_stacked, position_label, scaled, under_box};
 use crate::save::{ask_path, write_png};
 use crate::selection::{Grip, Hit, Modifiers, Point, Rect, Selection};
+use crate::settings::{self, Settings};
 use crate::tray;
 
-// Posted by the keyboard hook when the capture key is pressed.
+// Posted by the keyboard hook when the capture key is pressed, or with `hook::RECORDED` for a key the settings menu is
+// waiting for.
 pub const WM_SNAP_KEY: u32 = WM_APP + 1;
+
+// Posted by `redraw` while the window is see-through, which gets no `WM_PAINT`.
+const WM_SNAP_DRAW: u32 = WM_APP + 4;
 
 // Sizes in pixels at 100% display scaling; they grow with the scaling.
 const HITSLOP_INSIDE: i32 = 10; // how far an edge's grab zone reaches into the box
@@ -79,7 +89,9 @@ pub const CLASS_NAME: PCWSTR = w!("snap.overlay");
 
 // Everything that exists while the overlay is open.
 struct Shot {
-	image: Image,
+	image: Image,   // with no pixels when `live`
+	live: bool,     // opened from the tray: the settings menu over the live screen, with no screenshot or box
+	config: Config, // as read when it opened or last saved from the settings menu
 	selection: Selection,
 	hover: Point,
 	scale: f32,
@@ -106,14 +118,19 @@ struct Shot {
 	old_boxes: Vec<(Rect, Tween)>, // dotted outlines of boxes before a drag, fading out
 	flash: Option<(Rect, Tween)>,
 	last_frame: Instant,
-	pacing: bool,             // the vsync thread is posting frames
-	saving: bool,             // the Save As dialog is open
-	closing: bool,            // fading out; input is ignored
-	quitting: bool,           // fading out, then quitting snap
-	confirm: Option<Confirm>, // asking whether to quit snap; kept while it fades out after an answer
+	pacing: bool,               // the vsync thread is posting frames
+	saving: bool,               // the Save As dialog is open
+	closing: bool,              // fading out; input is ignored
+	close_from: f32,            // `fade`'s value when closing started
+	quitting: bool,             // fading out, then quitting snap
+	confirm: Option<Confirm>,   // asking whether to quit snap; kept while it fades out after an answer
+	settings: Option<Settings>, // the settings menu; kept while it fades out after closing
 }
 
 thread_local! {
+	// Whether the window is set up for see-through drawing with `UpdateLayeredWindow` (see `set_live_style`).
+	static LIVE_STYLE: Cell<bool> = const { Cell::new(false) };
+	static DRAW_POSTED: Cell<bool> = const { Cell::new(false) }; // a `WM_SNAP_DRAW` is on its way
 	// The window procedure can be re-entered by Win32 calls that send messages (ShowWindow, ReleaseCapture, the
 	// clipboard), so the state is only borrowed around code that makes no such calls.
 	static SHOT: RefCell<Option<Shot>> = const { RefCell::new(None) };
@@ -152,8 +169,9 @@ pub fn create() -> Result<HWND> {
 		if RegisterClassExW(&class) == 0 {
 			return Err(Error::from_thread());
 		}
+		// layered, so closing can fade the whole window out, crossfading the screenshot to the live screen under it
 		CreateWindowExW(
-			WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+			WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
 			CLASS_NAME,
 			w!("snap"),
 			WS_POPUP,
@@ -169,39 +187,49 @@ pub fn create() -> Result<HWND> {
 	}
 }
 
-fn open(window: HWND) -> Result<()> {
-	let image = capture_screen()?;
-	let (width, height) = (image.width, image.height);
+// Opens the overlay on a fresh screenshot, or with `live`, the settings menu over the live screen.
+fn open(window: HWND, live: bool) -> Result<()> {
 	let config = config::load();
+	let image = if live {
+		let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+		Image {
+			width,
+			height,
+			pixels: Vec::new(),
+		}
+	} else {
+		capture_screen()?
+	};
+	let (width, height) = (image.width, image.height);
 	let animations = config.animations.active();
 	let scale = unsafe { GetDpiForWindow(window) } as f32 / 96.0;
+	set_live_style(window, live);
 
-	let (d2d, write, label_format, buttons) = with_gpu(|gpu| {
-		gpu.prepare(window, width, height, config.hardware_acceleration)?;
-		gpu.upload(&image)?;
+	let (d2d, write, label_format, buttons, settings) = with_gpu(|gpu| {
+		if !live {
+			gpu.prepare(window, width, height, config.hardware_acceleration)?;
+			gpu.upload(&image)?;
+		}
+		let settings = live
+			.then(|| Settings::new(&gpu.write, scale, (width, height), config, animations.enabled))
+			.transpose()?;
 		Ok((
 			gpu.d2d.clone(),
 			gpu.write.clone(),
 			text_format(&gpu.write, scaled(LABEL_FONT_SIZE, scale) as f32)?,
 			Buttons::new(&gpu.d2d, scale)?,
+			settings,
 		))
 	})?;
 	let start = Context {
-		mode: Mode::Box,
+		mode: if live { Mode::Settings } else { Mode::Box },
 		has_box: false,
+		can_undo: false,
+		can_redo: false,
+		recording: false,
 		pointer: Pointer::Outside,
 	};
-	let hints = match config
-		.ui
-		.hints
-		.then(|| Hints::new(&d2d, &write, scale, height, &config.keys, start, animations.enabled))
-	{
-		Some(Err(err)) => {
-			eprintln!("snap: couldn't lay out the hints: {err}");
-			None
-		}
-		hints => hints.and_then(|hints| hints.ok()),
-	};
+	let hints = make_hints(&d2d, &write, scale, height, &config, start);
 
 	let mut cursor = POINT::default();
 	let _ = unsafe { GetCursorPos(&mut cursor) };
@@ -211,6 +239,8 @@ fn open(window: HWND) -> Result<()> {
 	fade.retarget(1.0, now);
 	let mut shot = Shot {
 		image,
+		live,
+		config,
 		selection: Selection::new(
 			width,
 			height,
@@ -257,7 +287,7 @@ fn open(window: HWND) -> Result<()> {
 		stack_box: 0,
 		fade,
 		main_fade: Tween::new(
-			1.0,
+			if live { 0.0 } else { 1.0 },
 			if animations.enabled { MAIN_FADE } else { Duration::ZERO },
 			cubic_out,
 		),
@@ -268,27 +298,81 @@ fn open(window: HWND) -> Result<()> {
 		pacing: false,
 		saving: false,
 		closing: false,
+		close_from: 1.0,
 		quitting: false,
 		confirm: None,
+		settings,
 	};
 	// no fade when the overlay opens with the mouse already over the hints
 	shot.hints_fade = Tween::new(shot.hints_target(), HINT_FADE, cubic_out);
 	SHOT.with(|cell| *cell.borrow_mut() = Some(shot));
 
 	unsafe {
+		if live {
+			// a see-through window shows nothing until its first frame
+			render_or_report(window);
+		} else {
+			// fully opaque again after the last close faded it out
+			set_window_opacity(window, 1.0)?;
+		}
 		SetWindowPos(window, Some(HWND_TOPMOST), 0, 0, width, height, SWP_SHOWWINDOW)?;
-		// paint right away, so nothing stale shows before the first frame
-		let _ = UpdateWindow(window);
+		if !live {
+			// paint right away, so nothing stale shows before the first frame
+			let _ = UpdateWindow(window);
+		}
 		bring_to_front(window);
 	}
 	keep_animating(window);
 	Ok(())
 }
 
-fn open_or_report(window: HWND) {
-	if let Err(err) = open(window) {
+fn open_or_report(window: HWND, live: bool) {
+	if let Err(err) = open(window, live) {
 		eprintln!("snap: couldn't open the overlay: {err}");
 		hide(window);
+	}
+}
+
+// The hints for `config`'s keys, if it wants them, starting out showing `context`.
+fn make_hints(
+	d2d: &ID2D1Factory,
+	write: &IDWriteFactory,
+	scale: f32,
+	height: i32,
+	config: &Config,
+	context: Context,
+) -> Option<Hints> {
+	if !config.ui.hints {
+		return None;
+	}
+	let animate = config.animations.active().enabled;
+	match Hints::new(d2d, write, scale, height, &config.keys, context, animate) {
+		Ok(hints) => Some(hints),
+		Err(err) => {
+			eprintln!("snap: couldn't lay out the hints: {err}");
+			None
+		}
+	}
+}
+
+// Switches the window between showing a screenshot, faded as a whole with `SetLayeredWindowAttributes`, and see-through
+// drawing with `UpdateLayeredWindow`. Windows only allows one after the other once the layered style is cleared and set
+// again.
+fn set_live_style(window: HWND, live: bool) {
+	if LIVE_STYLE.replace(live) == live {
+		return;
+	}
+	unsafe {
+		let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+		SetWindowLongPtrW(window, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+		SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+	}
+	if !live {
+		// made for the window as it was before
+		let _ = with_gpu(|gpu| {
+			gpu.release_target();
+			Ok(())
+		});
 	}
 }
 
@@ -315,6 +399,7 @@ fn hide(window: HWND) {
 		let _ = ShowWindow(window, SW_HIDE);
 	}
 	stop_pacing();
+	hook::record(false);
 	let quitting = SHOT
 		.with(|cell| cell.borrow_mut().take())
 		.is_some_and(|shot| shot.quitting);
@@ -336,11 +421,18 @@ fn quit(window: HWND) {
 	}
 }
 
+// Sets the opacity of the whole window, 0 to 1.
+fn set_window_opacity(window: HWND, opacity: f32) -> Result<()> {
+	let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+	unsafe { SetLayeredWindowAttributes(window, COLORREF(0), alpha, LWA_ALPHA) }
+}
+
 // Starts closing: fades out (with a flash over `flash` first, if given), then hides.
 fn close(window: HWND, flash: Option<Rect>) {
 	let animating = with_shot(|shot| {
 		let now = Instant::now();
 		shot.closing = true;
+		shot.close_from = shot.fade.value(now);
 		if shot.animations.overlay_fade {
 			shot.fade.retarget(0.0, now);
 		} else {
@@ -353,6 +445,8 @@ fn close(window: HWND, flash: Option<Rect>) {
 		}
 		shot.is_animating(now)
 	});
+	// the normal cursor right away, not once the fade-out is done (Windows only asks again when the mouse moves)
+	set_cursor();
 	if animating == Some(true) {
 		redraw(window);
 		keep_animating(window);
@@ -367,8 +461,10 @@ enum Action {
 	CopyWhole,
 	Save,
 	Close,
-	Quit,
+	Undo,
+	Redo,
 	Clear,
+	Settings,
 }
 
 impl Action {
@@ -384,7 +480,9 @@ impl Action {
 			(keys.copy_whole, Self::CopyWhole),
 			(keys.save, Self::Save),
 			(keys.close, Self::Close),
-			(keys.quit, Self::Quit),
+			(keys.undo, Self::Undo),
+			(keys.redo, Self::Redo),
+			(keys.settings, Self::Settings),
 		]
 		.into_iter()
 		.find(|(bound, _)| *bound == chord)
@@ -397,8 +495,10 @@ impl Action {
 			Self::CopyWhole => copy(window, CopyMode::Whole),
 			Self::Save => save(window),
 			Self::Close => close(window, None),
-			Self::Quit => quit_key(window),
-			Self::Clear => clear(window),
+			Self::Undo => change(window, Selection::undo),
+			Self::Redo => change(window, Selection::redo),
+			Self::Clear => change(window, Selection::clear),
+			Self::Settings => open_settings(window),
 		}
 	}
 }
@@ -408,14 +508,14 @@ fn can_clear(shot: &Shot) -> bool {
 	shot.selection.rect().is_some() && !shot.selection.is_dragging()
 }
 
-// `cancel` with a box: clears it.
-fn clear(window: HWND) {
-	with_shot(|shot| shot.selection.clear());
+// Changes the box with `f` (clearing it, or undo and redo), animating whatever that starts.
+fn change(window: HWND, f: fn(&mut Selection)) {
+	with_shot(|shot| f(&mut shot.selection));
 	redraw(window);
 	keep_animating(window);
 }
 
-// Shows the confirmation for quitting snap, ending any drag (it can come from Shift+Esc mid-drag).
+// Shows the confirmation for quitting snap, ending any drag.
 fn ask_to_quit(window: HWND) {
 	// WM_CAPTURECHANGED ends the drag
 	let _ = unsafe { ReleaseCapture() };
@@ -453,15 +553,6 @@ fn ask_to_quit(window: HWND) {
 	keep_animating(window);
 }
 
-// The quit key, or Alt+F4 set to ask: asks to quit, or picks Quit if already asking.
-fn quit_key(window: HWND) {
-	if with_shot(|shot| shot.is_confirming()) == Some(true) {
-		answer(window, Choice::Primary);
-	} else {
-		ask_to_quit(window);
-	}
-}
-
 // Answers the quit confirmation: quits snap, or fades the confirmation out.
 fn answer(window: HWND, choice: Choice) {
 	// quitting leaves the confirmation up, fading out with the rest
@@ -478,10 +569,105 @@ fn answer(window: HWND, choice: Choice) {
 	keep_animating(window);
 }
 
-// What a click picked: a button, or an answer to the confirmation.
+// Opens the settings menu over the box, ending any drag.
+fn open_settings(window: HWND) {
+	// WM_CAPTURECHANGED ends the drag
+	let _ = unsafe { ReleaseCapture() };
+	let Some((scale, screen, config, animate)) = with_shot(|shot| {
+		(
+			shot.scale,
+			(shot.image.width, shot.image.height),
+			shot.config,
+			shot.animations.enabled,
+		)
+	}) else {
+		return;
+	};
+	match with_gpu(|gpu| Settings::new(&gpu.write, scale, screen, config, animate)) {
+		Ok(settings) => {
+			with_shot(|shot| {
+				shot.pressed = None;
+				shot.settings = Some(settings);
+			});
+		}
+		Err(err) => eprintln!("snap: couldn't show the settings: {err}"),
+	}
+	redraw(window);
+	keep_animating(window);
+}
+
+// Closes the settings menu, going back to the box, or closes the overlay if it was opened from the tray.
+fn close_settings(window: HWND) {
+	hook::record(false);
+	let live = with_shot(|shot| {
+		// from the tray, the menu fades out with the rest
+		if !shot.live
+			&& let Some(settings) = &mut shot.settings
+		{
+			settings.close(Instant::now());
+		}
+		shot.live
+	});
+	if live == Some(true) {
+		close(window, None);
+	} else {
+		redraw(window);
+		keep_animating(window);
+	}
+}
+
+// The tray's Settings: the menu over the live screen if the overlay is closed, or over the box if it's open.
+fn settings_from_tray(window: HWND) {
+	match with_shot(|shot| (shot.saving || shot.quitting, shot.closing, shot.mode())) {
+		Some((true, _, _)) => {}
+		Some((_, true, _)) => {
+			hide(window);
+			open_or_report(window, true);
+		}
+		Some((_, _, Mode::Box)) => open_settings(window),
+		Some(_) => {}
+		None => open_or_report(window, true),
+	}
+}
+
+// Changes the settings menu with `f` (a click, or a key for a keybind), which says whether the config changed, then
+// saves and applies the config if it did.
+fn change_settings(window: HWND, f: impl FnOnce(&mut Settings) -> Result<bool>) {
+	let result = with_shot(|shot| {
+		let settings = shot.active_settings()?;
+		let result = f(settings).map(|changed| changed.then_some(settings.config));
+		Some((result, settings.is_waiting()))
+	})
+	.flatten();
+	// the hook sends keys here while a keybind waits for one
+	hook::record(result.as_ref().is_some_and(|(_, waiting)| *waiting));
+	match result {
+		Some((Ok(Some(config)), _)) => apply(window, config),
+		Some((Err(err), _)) => eprintln!("snap: couldn't lay out the settings: {err}"),
+		_ => {}
+	}
+	redraw(window);
+	keep_animating(window);
+}
+
+// Saves `config` to `config.toml` and starts using it.
+fn apply(window: HWND, config: Config) {
+	if let Err(err) = config::save(&config) {
+		eprintln!("snap: couldn't save config.toml: {err}");
+	}
+	// the config watcher does this too, a moment later
+	hook::set_capture(config.keys.capture);
+	if let Ok((d2d, write)) = with_gpu(|gpu| Ok((gpu.d2d.clone(), gpu.write.clone()))) {
+		with_shot(|shot| shot.apply(config, &d2d, &write));
+	}
+	redraw(window);
+}
+
+// What a click picked: a button, an answer to the confirmation, or a control in the settings menu.
 enum Click {
 	Button(Button),
 	Choice(Choice),
+	Setting(settings::Target),
 }
 
 #[derive(Clone, Copy)]
@@ -546,14 +732,22 @@ fn paint(window: HWND) {
 	let mut ps = PAINTSTRUCT::default();
 	unsafe {
 		BeginPaint(window, &mut ps);
-		let drawn = with_shot(|shot| with_gpu(|gpu| shot.render(window, gpu)));
-		if let Some(Err(err)) = drawn {
-			eprintln!("snap: couldn't draw the overlay: {err}");
-			// a lost GPU gets a fresh render target on the next paint
-			redraw(window);
-		}
+		render_or_report(window);
 		let _ = EndPaint(window, &ps);
 	}
+	after_frame(window);
+}
+
+fn render_or_report(window: HWND) {
+	let drawn = with_shot(|shot| with_gpu(|gpu| shot.render(window, gpu)));
+	if let Some(Err(err)) = drawn {
+		eprintln!("snap: couldn't draw the overlay: {err}");
+		// a lost GPU gets a fresh render target on the next paint
+		redraw(window);
+	}
+}
+
+fn after_frame(window: HWND) {
 	// the buttons can appear or move under a still mouse (after a drag, a nudge, or while the box springs); not while
 	// Save As has the mouse
 	if is_interactive() && with_shot(|shot| shot.saving) == Some(false) {
@@ -625,6 +819,10 @@ impl Shot {
 			labels.push((origin(x, y), position));
 			labels.push((origin(under.label.left, under.label.top), size));
 			self.row = Some(under.buttons);
+		} else {
+			// a box cleared mid-switch would otherwise leave `stack` short of its goal forever, keeping
+			// `is_animating` true, so the overlay never finished closing
+			self.stack.snap(if self.stacked { 1.0 } else { 0.0 });
 		}
 		let hovered = self.button_at(self.hover);
 		let highlight = match (drawn, self.selection.highlight(self.hover)) {
@@ -636,7 +834,13 @@ impl Shot {
 		};
 		let buttons_fade = self.buttons_fade.value(now);
 		let buttons = match self.row {
-			Some(row) if buttons_fade > 0.0 => Some((&self.buttons, row, hovered, buttons_fade)),
+			Some(row) if buttons_fade > 0.0 => {
+				let history = History {
+					undo: self.selection.can_undo(),
+					redo: self.selection.can_redo(),
+				};
+				Some((&self.buttons, row, hovered, history, buttons_fade))
+			}
 			_ => None,
 		};
 		let mut dotted: Vec<(Rect, f32)> = self
@@ -663,7 +867,25 @@ impl Shot {
 		if self.confirm.as_ref().is_some_and(|confirm| confirm.is_gone(now)) {
 			self.confirm = None;
 		}
-		let ui = self.fade.value(now);
+		if self.settings.as_ref().is_some_and(|settings| settings.is_gone(now)) {
+			self.settings = None;
+		}
+		// while closing, the scene stays as it was and the whole window fades out instead, so the screenshot crossfades
+		// to what's on screen now
+		let closing = self.closing && self.close_from > 0.0;
+		let window_opacity = if closing {
+			self.fade.value(now) / self.close_from
+		} else {
+			1.0
+		};
+		let ui = if self.closing {
+			if closing && !self.live {
+				set_window_opacity(window, window_opacity)?;
+			}
+			self.close_from
+		} else {
+			self.fade.value(now)
+		};
 		let scene = Scene {
 			dim: ui,
 			ui,
@@ -684,32 +906,59 @@ impl Shot {
 					self.close_fade.value(now),
 				)
 			}),
+			gear: self.close_button.then(|| {
+				(
+					&self.buttons,
+					self.buttons.gear_rect(self.image.width),
+					hovered == Some(Button::Gear),
+					self.close_fade.value(now),
+				)
+			}),
 			confirm: (self.confirm.as_ref()).map(|confirm| (confirm, confirm.hit(self.hover), now)),
+			settings: (self.settings.as_ref()).map(|settings| (settings, settings.hit(self.hover), now)),
 		};
+		if self.live {
+			let screen = (self.image.width, self.image.height);
+			return gpu.draw_live(window, screen, self.hardware, window_opacity, &scene);
+		}
 		gpu.prepare(window, self.image.width, self.image.height, self.hardware)?;
 		gpu.upload(&self.image)?;
 		gpu.draw(&scene)
 	}
 
 	// The button under `p`. The box's buttons are where they were last drawn, so they work where they show while the
-	// box springs, and take no clicks while there's no box (fading out). No button takes clicks mid-drag or while the
-	// confirmation is up.
+	// box springs, and take no clicks while there's no box (fading out). No button takes clicks mid-drag or while a
+	// dialog is up.
 	fn button_at(&self, p: Point) -> Option<Button> {
-		if self.selection.is_dragging() || self.is_confirming() {
+		if self.selection.is_dragging() || self.mode() != Mode::Box {
 			return None;
 		}
-		if self.is_close_shown() && self.buttons.close_hit_rect(self.image.width).contains(p) {
-			return Some(Button::Close);
+		if self.is_close_shown() {
+			if self.buttons.close_hit_rect(self.image.width).contains(p) {
+				return Some(Button::Close);
+			}
+			if self.buttons.gear_hit_rect(self.image.width).contains(p) {
+				return Some(Button::Gear);
+			}
 		}
 		self.selection.rect()?;
 		self.buttons.hit(self.row?, p)
 	}
 
-	// Whether the close button shows and takes clicks: it's on in the config, and the box (with the margin where it can
-	// be grabbed) doesn't reach it, so grabbing the box's corner up there always works.
+	// Whether the close and settings buttons show and take clicks: they're on in the config, and the box (with the
+	// margin where it can be grabbed) doesn't reach them, so grabbing the box's corner up there always works.
 	fn is_close_shown(&self) -> bool {
 		let slop = scaled(HITSLOP_OUTSIDE, self.scale);
-		let close = self.buttons.close_hit_rect(self.image.width);
+		let (close, gear) = (
+			self.buttons.close_hit_rect(self.image.width),
+			self.buttons.gear_hit_rect(self.image.width),
+		);
+		let close = Rect {
+			left: gear.left,
+			top: gear.top.min(close.top),
+			right: close.right,
+			bottom: gear.bottom.max(close.bottom),
+		};
 		self.close_button
 			&& !(self.selection.rect()).is_some_and(|r| {
 				let grabbable = Rect {
@@ -731,10 +980,21 @@ impl Shot {
 		self.confirm.as_ref().is_some_and(|confirm| !confirm.is_answered())
 	}
 
+	// The settings menu, while it's up and not closing.
+	fn active_settings(&mut self) -> Option<&mut Settings> {
+		self.settings.as_mut().filter(|settings| !settings.is_closed())
+	}
+
+	fn is_in_settings(&self) -> bool {
+		self.settings.as_ref().is_some_and(|settings| !settings.is_closed())
+	}
+
 	// Anything but `Box` hides the box and its UI. Quitting keeps it hidden while everything fades out.
 	fn mode(&self) -> Mode {
 		if self.is_confirming() || self.quitting {
 			Mode::Quit
+		} else if self.live || self.is_in_settings() {
+			Mode::Settings
 		} else {
 			Mode::Box
 		}
@@ -744,8 +1004,19 @@ impl Shot {
 	fn hint_context(&self) -> Context {
 		let mode = self.mode();
 		let confirm_hit = (self.confirm.as_ref()).and_then(|confirm| confirm.hit(self.hover));
+		let settings_hit = (self.settings.as_ref()).and_then(|settings| settings.pressed.or(settings.hit(self.hover)));
 		let pointer = match self.pressed.or(self.button_at(self.hover)) {
 			_ if mode == Mode::Quit => confirm_hit.map_or(Pointer::Outside, Pointer::Choice),
+			_ if mode == Mode::Settings => match settings_hit {
+				Some(settings::Target::Switch(_)) => Pointer::Switch,
+				Some(settings::Target::Bind(_)) => Pointer::Bind,
+				Some(settings::Target::AltF4(_)) => Pointer::Pick,
+				Some(settings::Target::Reset) => Pointer::Reset,
+				None => Pointer::Outside,
+			},
+			Some(Button::Gear) => Pointer::Gear,
+			Some(Button::Undo) => Pointer::Undo,
+			Some(Button::Redo) => Pointer::Redo,
 			Some(Button::Copy) => Pointer::Copy,
 			Some(Button::Save) => Pointer::Save,
 			Some(Button::Clear) => Pointer::Clear,
@@ -759,8 +1030,24 @@ impl Shot {
 		Context {
 			mode,
 			has_box: self.selection.rect().is_some(),
+			can_undo: self.selection.can_undo(),
+			can_redo: self.selection.can_redo(),
+			recording: self.settings.as_ref().is_some_and(Settings::is_waiting),
 			pointer,
 		}
+	}
+
+	// Starts using `config`, just saved from the settings menu. Animations already set up keep their length.
+	fn apply(&mut self, config: Config, d2d: &ID2D1Factory, write: &IDWriteFactory) {
+		self.config = config;
+		self.hardware = config.hardware_acceleration;
+		self.old_box_outline = config.ui.old_box_outline;
+		self.new_box_outline = config.ui.new_box_outline;
+		self.close_button = config.ui.close_button;
+		self.animations = config.animations.active();
+		self.keys = config.keys;
+		// laid out again for the new keys
+		self.hints = make_hints(d2d, write, self.scale, self.image.height, &config, self.hint_context());
 	}
 
 	// Fully shown, or hidden while the mouse is over them.
@@ -777,6 +1064,7 @@ impl Shot {
 			|| !self.hints_fade.is_done(now)
 			|| (self.hints.as_ref()).is_some_and(|hints| hints.is_animating(self.hint_context(), now))
 			|| (self.confirm.as_ref()).is_some_and(|confirm| confirm.is_animating(now))
+			|| (self.settings.as_ref()).is_some_and(|settings| settings.is_animating(now))
 			|| !self.old_boxes.is_empty()
 			|| self.flash.is_some()
 			|| !self.motion.is_settled(self.selection.rect())
@@ -784,6 +1072,11 @@ impl Shot {
 			|| !self.close_fade.is_done(now)
 			|| !self.main_fade.is_done(now)
 			|| self.stack.value != if self.stacked { 1.0 } else { 0.0 }
+	}
+
+	// Whether it's closing and has finished fading out (and flashing). Anything else still moving doesn't matter then.
+	fn is_closed(&self, now: Instant) -> bool {
+		self.closing && self.fade.is_done(now) && self.flash.is_none_or(|(_, flash)| flash.is_done(now))
 	}
 
 	// Ends a drag at `p`, leaving the old box's outline to fade out (or vanish, with animations off).
@@ -853,13 +1146,14 @@ fn on_frame(window: HWND) {
 	// this redraw also paints the final frame of anything that just finished
 	redraw(window);
 	let state = with_shot(|shot| {
-		let animating = shot.is_animating(Instant::now());
+		let now = Instant::now();
+		let animating = shot.is_animating(now);
 		shot.pacing = animating;
-		(animating, shot.closing)
+		(animating, shot.is_closed(now))
 	});
 	match state {
-		Some((true, _)) => {}
-		Some((false, true)) => hide(window),
+		Some((_, true)) => hide(window),
+		Some((true, false)) => {}
 		_ => stop_pacing(),
 	}
 }
@@ -926,7 +1220,7 @@ fn set_cursor() -> bool {
 		y: cursor.y,
 	};
 	let name = with_shot(|shot| match shot.pressed.or(shot.button_at(hover)) {
-		_ if shot.is_confirming() => IDC_ARROW,
+		_ if shot.closing || shot.mode() != Mode::Box => IDC_ARROW,
 		Some(_) => IDC_ARROW,
 		None => cursor_for(shot.selection.active_hit(hover)),
 	});
@@ -946,8 +1240,12 @@ fn point_from(lparam: LPARAM) -> Point {
 }
 
 fn redraw(window: HWND) {
-	unsafe {
-		let _ = InvalidateRect(Some(window), None, false);
+	if !LIVE_STYLE.get() {
+		unsafe {
+			let _ = InvalidateRect(Some(window), None, false);
+		}
+	} else if !DRAW_POSTED.replace(true) {
+		let _ = unsafe { PostMessageW(Some(window), WM_SNAP_DRAW, WPARAM(0), LPARAM(0)) };
 	}
 }
 
@@ -958,6 +1256,11 @@ fn is_interactive() -> bool {
 
 unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
 	match msg {
+		WM_SNAP_KEY if wparam.0 == hook::RECORDED => {
+			let chord = Chord::from_bits(lparam.0 as u32);
+			change_settings(window, |settings| settings.record(chord));
+			LRESULT(0)
+		}
 		WM_SNAP_KEY => {
 			match with_shot(|shot| (shot.saving || shot.quitting, shot.closing)) {
 				// the capture key does nothing while the Save As dialog is open or snap is quitting
@@ -965,13 +1268,13 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 				// a fresh capture right away, skipping the rest of the fade-out
 				Some((_, true)) => {
 					hide(window);
-					open_or_report(window);
+					open_or_report(window, false);
 				}
 				// the capture key does whatever it's also bound to in the overlay (copying the whole screen by default),
-				// and nothing while the confirmation is up
+				// and nothing while a dialog is up
 				Some(_) => {
 					let action = with_shot(|shot| {
-						(!shot.is_confirming())
+						(shot.mode() == Mode::Box)
 							.then(|| Action::for_chord(&shot.keys, shot.keys.capture, can_clear(shot)))
 							.flatten()
 					})
@@ -980,17 +1283,19 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 						action.run(window);
 					}
 				}
-				None => open_or_report(window),
+				None => open_or_report(window, false),
 			}
 			LRESULT(0)
 		}
 		tray::WM_TRAY => {
 			match (lparam.0 & 0xFFFF) as u32 {
-				WM_LBUTTONUP if with_shot(|_| ()).is_none() => open_or_report(window),
+				WM_LBUTTONUP if with_shot(|_| ()).is_none() => open_or_report(window, false),
 				WM_RBUTTONUP => {
 					let command = tray::show_menu(window);
 					if command == tray::MENU_QUIT {
 						quit(window);
+					} else if command == tray::MENU_SETTINGS {
+						settings_from_tray(window);
 					}
 				}
 				_ => {}
@@ -1008,6 +1313,12 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			on_frame(window);
 			LRESULT(0)
 		}
+		WM_SNAP_DRAW => {
+			DRAW_POSTED.set(false);
+			render_or_report(window);
+			after_frame(window);
+			LRESULT(0)
+		}
 		// the paint covers the whole window, so erasing first would only flicker
 		WM_ERASEBKGND => LRESULT(1),
 		WM_PAINT => {
@@ -1021,6 +1332,14 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 				shot.hover = p;
 				if let Some(confirm) = shot.active_confirm() {
 					confirm.pressed = confirm.hit(p);
+					return;
+				}
+				if let Some(settings) = shot.active_settings() {
+					settings.pressed = settings.hit(p);
+					return;
+				}
+				// no box over the live screen
+				if shot.live {
 					return;
 				}
 				shot.pressed = shot.button_at(p);
@@ -1041,6 +1360,19 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 					let changed = confirm.hit(shot.hover) != confirm.hit(p);
 					shot.hover = p;
 					return changed;
+				}
+				if let Some(settings) = &shot.settings
+					&& !settings.is_closed()
+				{
+					let changed = settings.hit(shot.hover) != settings.hit(p);
+					shot.hover = p;
+					let target = shot.hints_target();
+					shot.hints_fade.retarget(target, Instant::now());
+					return changed;
+				}
+				if shot.live {
+					shot.hover = p;
+					return false;
 				}
 				let state = |shot: &Shot, p| (shot.selection.rect(), shot.selection.highlight(p), shot.button_at(p));
 				let before = state(shot, shot.hover);
@@ -1069,6 +1401,15 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 						.filter(|&choice| confirm.hit(p) == Some(choice))
 						.map(Click::Choice);
 				}
+				if let Some(settings) = shot.active_settings() {
+					let pressed = settings.pressed.take();
+					return pressed
+						.filter(|&target| settings.hit(p) == Some(target))
+						.map(Click::Setting);
+				}
+				if shot.live {
+					return None;
+				}
 				match shot.pressed.take() {
 					Some(pressed) => (shot.button_at(p) == Some(pressed)).then_some(Click::Button(pressed)),
 					None => {
@@ -1081,17 +1422,28 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			match clicked.flatten() {
 				Some(Click::Button(Button::Copy)) => copy(window, CopyMode::Selection),
 				Some(Click::Button(Button::Save)) => save(window),
-				Some(Click::Button(Button::Clear)) => {
-					with_shot(|shot| shot.selection.clear());
-				}
+				Some(Click::Button(Button::Undo)) => change(window, Selection::undo),
+				Some(Click::Button(Button::Redo)) => change(window, Selection::redo),
+				Some(Click::Button(Button::Clear)) => change(window, Selection::clear),
 				// Shift+click quits snap, after asking
 				Some(Click::Button(Button::Close)) if key_down(VK_SHIFT) => ask_to_quit(window),
 				Some(Click::Button(Button::Close)) => close(window, None),
+				Some(Click::Button(Button::Gear)) => open_settings(window),
 				Some(Click::Choice(choice)) => answer(window, choice),
+				Some(Click::Setting(target)) => change_settings(window, |settings| settings.click(target)),
 				None => {}
 			}
 			redraw(window);
 			keep_animating(window);
+			LRESULT(0)
+		}
+		WM_MOUSEWHEEL if is_interactive() => {
+			// the high word is how far it turned, signed
+			let delta = (wparam.0 >> 16) as i16;
+			let scrolled = with_shot(|shot| shot.active_settings().is_some_and(|settings| settings.scroll(delta)));
+			if scrolled == Some(true) {
+				redraw(window);
+			}
 			LRESULT(0)
 		}
 		// the mouse was taken away mid-drag (for example by a system dialog), so end the drag where it was
@@ -1100,6 +1452,9 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 				shot.pressed = None;
 				if let Some(confirm) = shot.active_confirm() {
 					confirm.pressed = None;
+				}
+				if let Some(settings) = &mut shot.settings {
+					settings.pressed = None;
 				}
 				if shot.selection.is_dragging() {
 					shot.release(shot.hover);
@@ -1115,12 +1470,11 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			}
 			LRESULT(1)
 		}
-		// Alt+F4. "quit" leaves it to Windows, which closes the window and so quits snap (a newer copy closing this one
-		// sends WM_CLOSE straight away, so it's unaffected)
+		// Alt+F4. "quit" leaves it to Windows, which closes the window and so quits snap without asking (a newer copy
+		// closing this one sends WM_CLOSE straight away, so it's unaffected).
 		WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_CLOSE => {
 			match with_shot(|shot| shot.keys.alt_f4) {
-				Some(AltF4::Ask) if is_interactive() => quit_key(window),
-				Some(AltF4::Ask | AltF4::Disabled) => {}
+				Some(AltF4::Disabled) => {}
 				Some(AltF4::Quit) | None => return unsafe { DefWindowProcW(window, msg, wparam, lparam) },
 			}
 			LRESULT(0)
@@ -1167,10 +1521,24 @@ unsafe extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lp
 			};
 			// the confirmation takes only its answers (and Alt+F4, which goes on to Windows as `WM_SYSCOMMAND`)
 			if let Some(keys) = with_shot(|shot| shot.is_confirming().then_some(shot.keys)).flatten() {
-				if chord == keys.confirm || chord == keys.quit {
+				if chord == keys.confirm {
 					answer(window, Choice::Primary);
 				} else if chord == keys.cancel {
 					answer(window, Choice::Secondary);
+				} else if msg == WM_SYSKEYDOWN && key == VK_F4.0 {
+					return unsafe { DefWindowProcW(window, msg, wparam, lparam) };
+				}
+				return LRESULT(0);
+			}
+			// the settings menu closes on Esc or its own key; a keybind waiting for a key gets it from the hook instead
+			if let Some((waiting, keys)) = with_shot(|shot| {
+				let waiting = shot.settings.as_ref().is_some_and(Settings::is_waiting);
+				(shot.mode() == Mode::Settings).then_some((waiting, shot.keys))
+			})
+			.flatten()
+			{
+				if !waiting && (chord == Chord::plain(VK_ESCAPE.0) || chord == keys.settings) {
+					close_settings(window);
 				} else if msg == WM_SYSKEYDOWN && key == VK_F4.0 {
 					return unsafe { DefWindowProcW(window, msg, wparam, lparam) };
 				}

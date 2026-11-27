@@ -1,6 +1,6 @@
 // selection
 
-// The box the user draws on the overlay: creating, moving, resizing and flipping it.
+// The box the user draws on the overlay: creating, moving, resizing and flipping it, with undo and redo.
 // Pure logic with no Win32, so it can be unit tested.
 
 // How far the mouse has to move from the press before it counts as a drag, in pixels.
@@ -156,6 +156,12 @@ pub struct Selection {
 	modifiers: Modifiers,
 	last: Point, // where the mouse was at the last drag update
 	box_id: u32, // changes whenever a new box starts or the box is cleared
+	// The box before each change, oldest first, and the boxes undone, most recent last. No limit: each is a few bytes,
+	// and they only last while the overlay is open.
+	undo: Vec<Option<Rect>>,
+	redo: Vec<Option<Rect>>,
+	pressed_rect: Option<Rect>, // the box when the mouse went down, to record what the drag changed
+	nudging: bool,              // the last change was a nudge, so further nudges join it as one step
 }
 
 impl Selection {
@@ -175,6 +181,10 @@ impl Selection {
 			modifiers: Modifiers::default(),
 			last: Point { x: 0, y: 0 },
 			box_id: 0,
+			undo: Vec::new(),
+			redo: Vec::new(),
+			pressed_rect: None,
+			nudging: false,
 		}
 	}
 
@@ -245,11 +255,67 @@ impl Selection {
 		}
 	}
 
-	// Moves the box by `(dx, dy)`, stopping at the screen edges. Does nothing mid-drag or without a box.
+	// Moves the box by `(dx, dy)`, stopping at the screen edges. Does nothing mid-drag or without a box. Nudges in a
+	// row undo as one step.
 	pub fn nudge(&mut self, dx: i32, dy: i32) {
-		if let (Drag::Idle, Some(rect)) = (self.drag, self.rect) {
-			self.rect = Some(self.offset(rect, dx, dy));
+		let (Drag::Idle, Some(rect)) = (self.drag, self.rect) else {
+			return;
+		};
+		let moved = self.offset(rect, dx, dy);
+		if moved == rect {
+			return;
 		}
+		self.rect = Some(moved);
+		if !self.nudging {
+			self.record(Some(rect));
+		}
+		self.nudging = true;
+	}
+
+	pub fn can_undo(&self) -> bool {
+		!self.undo.is_empty()
+	}
+
+	pub fn can_redo(&self) -> bool {
+		!self.redo.is_empty()
+	}
+
+	// Puts the box back as it was before the last change. Does nothing mid-drag.
+	pub fn undo(&mut self) {
+		if !self.is_dragging()
+			&& let Some(previous) = self.undo.pop()
+		{
+			self.redo.push(self.rect);
+			self.restore(previous);
+		}
+	}
+
+	// Redoes the last change undone. Does nothing mid-drag.
+	pub fn redo(&mut self) {
+		if !self.is_dragging()
+			&& let Some(next) = self.redo.pop()
+		{
+			self.undo.push(self.rect);
+			self.restore(next);
+		}
+	}
+
+	// Saves `before` as a step to undo back to, if the box changed from it. A new change can't be redone over.
+	fn record(&mut self, before: Option<Rect>) {
+		self.nudging = false;
+		if before != self.rect {
+			self.undo.push(before);
+			self.redo.clear();
+		}
+	}
+
+	fn restore(&mut self, rect: Option<Rect>) {
+		// appearing or disappearing counts as a new box, so the animations jump instead of following
+		if rect.is_none() || self.rect.is_none() {
+			self.box_id = self.box_id.wrapping_add(1);
+		}
+		self.rect = rect;
+		self.nudging = false;
 	}
 
 	// Updates the held modifier keys, resizing the box right away if one changed mid-drag.
@@ -264,6 +330,7 @@ impl Selection {
 	}
 
 	pub fn press(&mut self, p: Point) {
+		self.pressed_rect = self.rect;
 		self.drag = Drag::Pressed {
 			start: p,
 			hit: self.hit_test(p),
@@ -435,23 +502,34 @@ impl Selection {
 		)
 	}
 
-	// Button released at `p`.
+	// Button released at `p`. Does nothing without a press (the button can come up after going down elsewhere).
 	pub fn release(&mut self, p: Point) {
+		if !self.is_dragging() {
+			return;
+		}
 		self.drag_to(p);
 		match self.drag {
 			// a click without dragging clears the box, but only outside it, so a click on the box can't lose it
-			Drag::Pressed { hit: Hit::Outside, .. } => self.clear(),
+			Drag::Pressed { hit: Hit::Outside, .. } => self.remove(),
 			_ => {
 				if self.rect.is_some_and(|r| r.is_empty()) {
-					self.clear();
+					self.remove();
 				}
 			}
 		}
 		self.drag = Drag::Idle;
+		self.record(self.pressed_rect);
 	}
 
 	// Removes the box. Not for mid-drag, where the drag would bring it back.
 	pub fn clear(&mut self) {
+		let before = self.rect;
+		self.remove();
+		self.record(before);
+	}
+
+	// Removes the box without recording a step.
+	fn remove(&mut self) {
 		self.rect = None;
 		self.box_id = self.box_id.wrapping_add(1);
 	}
@@ -771,5 +849,95 @@ mod tests {
 		assert_eq!(sel.drag_origin(), Some(rect(100, 100, 300, 200)));
 		sel.release(pt(250, 170));
 		assert_eq!(sel.drag_origin(), None);
+	}
+
+	#[test]
+	fn undo_and_redo_walk_through_the_changes() {
+		let mut sel = with_box();
+		let first = rect(100, 100, 300, 200);
+		// move it 50 right
+		drag(&mut sel, pt(200, 150), pt(250, 150));
+		let moved = rect(150, 100, 350, 200);
+		assert_eq!(sel.rect(), Some(moved));
+		sel.undo();
+		assert_eq!(sel.rect(), Some(first));
+		sel.undo();
+		assert_eq!(sel.rect(), None);
+		assert!(!sel.can_undo());
+		// nothing left to undo
+		sel.undo();
+		assert_eq!(sel.rect(), None);
+		sel.redo();
+		sel.redo();
+		assert_eq!(sel.rect(), Some(moved));
+		assert!(!sel.can_redo());
+	}
+
+	#[test]
+	fn a_new_change_drops_the_redo_steps() {
+		let mut sel = with_box();
+		sel.undo();
+		assert!(sel.can_redo());
+		drag(&mut sel, pt(500, 500), pt(600, 600));
+		assert!(!sel.can_redo());
+		sel.undo();
+		assert_eq!(sel.rect(), None);
+	}
+
+	#[test]
+	fn clearing_can_be_undone() {
+		let mut sel = with_box();
+		sel.clear();
+		sel.undo();
+		assert_eq!(sel.rect(), Some(rect(100, 100, 300, 200)));
+		// and so can a click outside, which clears it too
+		drag(&mut sel, pt(600, 600), pt(600, 600));
+		sel.undo();
+		assert_eq!(sel.rect(), Some(rect(100, 100, 300, 200)));
+	}
+
+	#[test]
+	fn nudges_in_a_row_undo_together() {
+		let mut sel = with_box();
+		for _ in 0..5 {
+			sel.nudge(1, 0);
+		}
+		sel.nudge(0, 1);
+		assert_eq!(sel.rect(), Some(rect(105, 101, 305, 201)));
+		sel.undo();
+		assert_eq!(sel.rect(), Some(rect(100, 100, 300, 200)));
+		// after an undo, nudging starts a new step
+		sel.redo();
+		sel.nudge(1, 0);
+		sel.undo();
+		assert_eq!(sel.rect(), Some(rect(105, 101, 305, 201)));
+	}
+
+	#[test]
+	fn changes_that_change_nothing_are_not_steps() {
+		let mut sel = with_box();
+		// a click inside, a drag back to where it started, and moving it there and back in one drag
+		drag(&mut sel, pt(200, 150), pt(201, 150));
+		sel.press(pt(200, 150));
+		sel.drag_to(pt(250, 150));
+		sel.release(pt(200, 150));
+		// so the only step is drawing the box
+		sel.undo();
+		assert_eq!(sel.rect(), None);
+		assert!(!sel.can_undo());
+	}
+
+	#[test]
+	fn undo_waits_for_the_drag() {
+		let mut sel = with_box();
+		sel.press(pt(200, 150));
+		sel.drag_to(pt(250, 150));
+		sel.undo();
+		assert_eq!(sel.rect(), Some(rect(150, 100, 350, 200)));
+		// a release without a press records nothing
+		sel.release(pt(250, 150));
+		sel.release(pt(400, 400));
+		sel.undo();
+		assert_eq!(sel.rect(), Some(rect(100, 100, 300, 200)));
 	}
 }

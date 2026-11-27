@@ -1,14 +1,16 @@
 // gpu
 
 // Drawing the overlay with Direct2D (on the GPU unless hardware acceleration is off) and its text with DirectWrite.
-// The screenshot is uploaded once when the overlay opens; each frame is then a handful of draw calls.
+// The screenshot is uploaded once when the overlay opens; each frame is then a handful of draw calls. The settings
+// menu opened from the tray has no screenshot: it's drawn see-through over the live screen into a pixel buffer, which
+// `UpdateLayeredWindow` copies to the window each frame.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::rc::Rc;
 use std::time::Instant;
 
-use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
+use windows::Win32::Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
 	D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -19,8 +21,8 @@ use windows::Win32::Graphics::Direct2D::{
 	D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_MITER, D2D1_LINE_JOIN_ROUND,
 	D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
 	D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_STROKE_STYLE_PROPERTIES,
-	D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1Geometry,
-	ID2D1HwndRenderTarget, ID2D1Layer, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+	D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory,
+	ID2D1Geometry, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
 	DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
@@ -29,15 +31,19 @@ use windows::Win32::Graphics::DirectWrite::{
 	IDWritePixelSnapping_Impl, IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION};
+use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::{BOOL, IUnknown, Ref, Result, implement, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
-use crate::buttons::{Button, Buttons};
+use crate::buttons::{Button, Buttons, History};
 use crate::capture::Image;
 use crate::confirm::{Choice, Confirm};
+use crate::gdi::Dib;
 use crate::hints::Hints;
 use crate::render::{around, outline};
 use crate::selection::Rect;
+use crate::settings::{self, Settings};
 
 const DIM_OPACITY: f32 = 0.5; // the 50% black over everything outside the box
 const DOTTED_OPACITY: f32 = 0.5;
@@ -57,10 +63,12 @@ pub struct Scene<'a> {
 	pub dotted: &'a [(Rect, f32)], // outlines with their opacity
 	pub flash: Option<(Rect, f32)>,
 	pub hints: Option<(&'a Hints, f32)>,
-	// the row, where it goes, the hovered button and its opacity
-	pub buttons: Option<(&'a Buttons, Rect, Option<Button>, f32)>,
+	// the row, where it goes, the hovered button, what can be undone and redone, and its opacity
+	pub buttons: Option<(&'a Buttons, Rect, Option<Button>, History, f32)>,
 	pub close: Option<(&'a Buttons, Rect, bool, f32)>, // the close button in the top-right corner, hovered, opacity
+	pub gear: Option<(&'a Buttons, Rect, bool, f32)>,  // the settings button left of it, the same way
 	pub confirm: Option<(&'a Confirm, Option<Choice>, Instant)>, // with its hovered button, and the time to draw it at
+	pub settings: Option<(&'a Settings, Option<settings::Target>, Instant)>, // the same way
 }
 
 // Brushes and the dash style for one render target.
@@ -69,7 +77,6 @@ pub struct Paint {
 	pub black: ID2D1SolidColorBrush,
 	dashes: ID2D1StrokeStyle,
 	pub round: ID2D1StrokeStyle, // round joins and caps, for the black strokes under white shapes
-	layer: ID2D1Layer,           // reused by `with_opacity`
 }
 
 struct Target {
@@ -79,10 +86,19 @@ struct Target {
 	screenshot: Option<ID2D1Bitmap>,
 }
 
+// The see-through version, drawn into `dib`.
+struct LiveTarget {
+	render_target: ID2D1DCRenderTarget,
+	hardware: bool,
+	paint: Paint,
+	dib: Dib,
+}
+
 pub struct Gpu {
 	pub d2d: ID2D1Factory,
 	pub write: IDWriteFactory,
 	target: Option<Target>,
+	live: Option<LiveTarget>,
 }
 
 impl Gpu {
@@ -92,6 +108,7 @@ impl Gpu {
 				d2d: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
 				write: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
 				target: None,
+				live: None,
 			})
 		}
 	}
@@ -154,10 +171,100 @@ impl Gpu {
 		Ok(())
 	}
 
-	// Frees the uploaded screenshot once the overlay closes.
+	// Frees the uploaded screenshot, and the see-through version's pixel buffer, once the overlay closes.
 	pub fn release_screenshot(&mut self) {
 		if let Some(target) = self.target.as_mut() {
 			target.screenshot = None;
+		}
+		self.live = None;
+	}
+
+	// Drops the window's render target, so the next `prepare` makes a new one. For after the window has been drawn
+	// see-through, which changes how Windows shows it.
+	pub fn release_target(&mut self) {
+		self.target = None;
+	}
+
+	// Draws a frame with no screenshot, see-through where nothing covers it, and shows it in `window` (a layered window
+	// at the screen's origin) at `opacity`, 0 to 1.
+	pub fn draw_live(
+		&mut self,
+		window: HWND,
+		(width, height): (i32, i32),
+		hardware: bool,
+		opacity: f32,
+		scene: &Scene,
+	) -> Result<()> {
+		let reusable = self
+			.live
+			.as_ref()
+			.is_some_and(|live| live.hardware == hardware && (live.dib.width, live.dib.height) == (width, height));
+		if !reusable {
+			self.live = None;
+			let properties = D2D1_RENDER_TARGET_PROPERTIES {
+				r#type: if hardware {
+					D2D1_RENDER_TARGET_TYPE_DEFAULT
+				} else {
+					D2D1_RENDER_TARGET_TYPE_SOFTWARE
+				},
+				pixelFormat: D2D1_PIXEL_FORMAT {
+					format: DXGI_FORMAT_B8G8R8A8_UNORM,
+					alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+				},
+				dpiX: 96.0,
+				dpiY: 96.0,
+				usage: D2D1_RENDER_TARGET_USAGE_NONE,
+				minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+			};
+			let render_target = unsafe { self.d2d.CreateDCRenderTarget(&properties)? };
+			let paint = Paint::new(&self.d2d, &render_target)?;
+			let dib = Dib::new(width, height)?;
+			self.live = Some(LiveTarget {
+				render_target,
+				hardware,
+				paint,
+				dib,
+			});
+		}
+		let Some(live) = &self.live else { return Ok(()) };
+		let bounds = RECT {
+			left: 0,
+			top: 0,
+			right: width,
+			bottom: height,
+		};
+		let result = unsafe {
+			live.render_target.BindDC(live.dib.dc, &bounds).and_then(|()| {
+				live.render_target.BeginDraw();
+				draw_scene(&live.render_target, &live.paint, None, (width, height), scene);
+				live.render_target.EndDraw(None, None)
+			})
+		};
+		if let Err(err) = result {
+			if err.code() == D2DERR_RECREATE_TARGET {
+				self.live = None;
+			}
+			return Err(err);
+		}
+		let blend = BLENDFUNCTION {
+			BlendOp: AC_SRC_OVER as u8,
+			BlendFlags: 0,
+			SourceConstantAlpha: (opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+			AlphaFormat: AC_SRC_ALPHA as u8,
+		};
+		let size = SIZE { cx: width, cy: height };
+		unsafe {
+			UpdateLayeredWindow(
+				window,
+				None,
+				Some(&POINT::default()),
+				Some(&size),
+				Some(live.dib.dc),
+				Some(&POINT::default()),
+				COLORREF(0),
+				Some(&blend),
+				ULW_ALPHA,
+			)
 		}
 	}
 
@@ -169,8 +276,10 @@ impl Gpu {
 			return Ok(());
 		};
 		let result = unsafe {
+			let size = screenshot.GetPixelSize();
 			target.render_target.BeginDraw();
-			draw_scene(&target.render_target, &target.paint, screenshot, scene);
+			let size = (size.width as i32, size.height as i32);
+			draw_scene(&target.render_target, &target.paint, Some(screenshot), size, scene);
 			target.render_target.EndDraw(None, None)
 		};
 		if let Err(err) = &result
@@ -199,7 +308,9 @@ impl Paint {
 			opacity,
 			..Default::default()
 		};
-		unsafe { render_target.PushLayer(&parameters, &self.layer) };
+		// no layer object: Direct2D makes one per push (Windows 8+), so these can nest, as in the settings menu. One
+		// shared layer pushed twice fails the whole frame in `EndDraw`.
+		unsafe { render_target.PushLayer(&parameters, None) };
 		draw();
 		unsafe { render_target.PopLayer() };
 	}
@@ -229,7 +340,6 @@ impl Paint {
 			};
 			Ok(Self {
 				white: render_target.CreateSolidColorBrush(&white, None)?,
-				layer: render_target.CreateLayer(None)?,
 				black: render_target.CreateSolidColorBrush(&black, None)?,
 				// dash lengths are in stroke widths, and the outlines are 1 px wide
 				dashes: d2d.CreateStrokeStyle(&stroke, Some(&[DASH, DASH]))?,
@@ -280,21 +390,29 @@ pub fn rect_f(rect: Rect) -> D2D_RECT_F {
 	}
 }
 
-// Draws one frame between `BeginDraw` and `EndDraw`.
-pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: &ID2D1Bitmap, scene: &Scene) {
+// Draws one frame of a `width` × `height` screen between `BeginDraw` and `EndDraw`. With no screenshot, it starts from
+// fully see-through.
+pub fn draw_scene(
+	render_target: &ID2D1RenderTarget,
+	paint: &Paint,
+	screenshot: Option<&ID2D1Bitmap>,
+	(width, height): (i32, i32),
+	scene: &Scene,
+) {
 	unsafe {
-		let size = screenshot.GetPixelSize();
-		let (width, height) = (size.width as i32, size.height as i32);
 		render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		render_target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-		render_target.DrawBitmap(
-			screenshot,
-			None,
-			1.0,
-			D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-			None,
-		);
+		match screenshot {
+			Some(screenshot) => render_target.DrawBitmap(
+				screenshot,
+				None,
+				1.0,
+				D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+				None,
+			),
+			None => render_target.Clear(Some(&D2D1_COLOR_F::default())),
+		}
 		paint.black.SetOpacity(DIM_OPACITY * scene.dim);
 		for rect in around(scene.selection, width, height) {
 			render_target.FillRectangle(&rect_f(rect), &paint.black);
@@ -363,22 +481,28 @@ pub fn draw_scene(render_target: &ID2D1RenderTarget, paint: &Paint, screenshot: 
 			}
 			render_target.DrawTextLayout(*origin, layout, &paint.white, D2D1_DRAW_TEXT_OPTIONS_NONE);
 		}
-		if let Some((buttons, row, hovered, opacity)) = scene.buttons {
-			buttons.draw(render_target, paint, row, hovered, opacity * ui);
+		if let Some((buttons, row, hovered, history, opacity)) = scene.buttons {
+			buttons.draw(render_target, paint, row, hovered, history, opacity * ui);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
-		if let Some((buttons, close, hovered, opacity)) = scene.close {
-			buttons.draw_one(render_target, paint, Button::Close, close, hovered, opacity * ui);
-			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+		for (button, corner) in [(Button::Close, scene.close), (Button::Gear, scene.gear)] {
+			if let Some((buttons, rect, hovered, opacity)) = corner {
+				buttons.draw_one(render_target, paint, button, rect, hovered, true, opacity * ui);
+				render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+			}
 		}
 		if let Some((rect, opacity)) = scene.flash {
 			paint.white.SetOpacity(FLASH_OPACITY * opacity * scene.main);
 			render_target.FillRectangle(&rect_f(rect), &paint.white);
 		}
 
-		// the dialog, then the hints, which describe it too
+		// the dialogs, then the hints, which describe them too
 		if let Some((confirm, hovered, now)) = scene.confirm {
 			confirm.draw(render_target, paint, scene.ui, hovered, now);
+			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+		}
+		if let Some((settings, hovered, now)) = scene.settings {
+			settings.draw(render_target, paint, scene.ui, hovered, now);
 			render_target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 		}
 		if let Some((hints, opacity)) = scene.hints {

@@ -1,0 +1,2 @@
+# default.toml is embedded in the exe and must match what saving the config writes, which is LF
+src/default.toml text eol=lf

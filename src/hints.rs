@@ -37,18 +37,26 @@ pub enum Pointer {
 	Outside, // starts a new box
 	Move,
 	Resize,
+	Undo,
+	Redo,
 	Copy,
 	Save,
 	Clear,
 	Close,
+	Gear,           // the settings button next to the close button
 	Choice(Choice), // a button of the quit confirmation
+	Switch,         // in the settings menu, like the ones after it
+	Bind,
+	Pick, // an Alt+F4 choice
+	Reset,
 }
 
 // What the overlay is showing, which decides the controls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-	Box,  // the screenshot with the box and its buttons
-	Quit, // asking whether to quit snap, with the box hidden
+	Box,      // the screenshot with the box and its buttons
+	Quit,     // asking whether to quit snap, with the box hidden
+	Settings, // the settings menu, with the box hidden
 }
 
 // What the hints describe.
@@ -56,6 +64,9 @@ pub enum Mode {
 pub struct Context {
 	pub mode: Mode,
 	pub has_box: bool,
+	pub can_undo: bool,
+	pub can_redo: bool,
+	pub recording: bool, // a keybind in the settings menu is waiting for a key
 	pub pointer: Pointer,
 }
 
@@ -85,6 +96,7 @@ const OUTLINE: f32 = 1.5; // how far the black stroke under everything reaches p
 
 const OPACITY: f32 = 0.5; // the hints are drawn at 50%, with their strokes
 const HELD_OPACITY: f32 = 1.0; // a key while it's held
+const UNBOUND_OPACITY: f32 = 0.5; // the "None" cap of an unbound action, relative to the other keys
 const KEY_FILL_OPACITY: f32 = 0.15; // relative to the key's opacity
 const VK_LBUTTON: u16 = 0x01;
 
@@ -101,7 +113,8 @@ enum Shape {
 struct Part {
 	codes: Vec<u16>, // the virtual-key codes that light it up
 	shapes: Vec<Shape>,
-	held: bool, // as of the last `update`
+	held: bool,    // as of the last `update`
+	unbound: bool, // the "None" cap of an action with no keybind, drawn dimmer
 }
 
 // One version of a row, like "Save" with a box and "Save the whole screen" without. Its shapes are relative to the
@@ -223,6 +236,10 @@ fn row_specs(keys: &Keys) -> Vec<(bool, Vec<Version>)> {
 				}),
 				mouse("Move the box", |c| c.mode == Box && c.pointer == Move),
 				mouse("Resize the box", |c| c.mode == Box && c.pointer == Resize),
+				mouse_or(keys.undo, "Undo", |c| c.mode == Box && c.pointer == Undo && c.can_undo),
+				mouse("Nothing to undo", |c| c.mode == Box && c.pointer == Undo && !c.can_undo),
+				mouse_or(keys.redo, "Redo", |c| c.mode == Box && c.pointer == Redo && c.can_redo),
+				mouse("Nothing to redo", |c| c.mode == Box && c.pointer == Redo && !c.can_redo),
 				mouse_or(keys.copy, "Copy", |c| c.mode == Box && c.pointer == Copy),
 				mouse_or(keys.save, "Save", |c| c.mode == Box && c.pointer == Save),
 				mouse_or(keys.cancel, "Clear the box", |c| c.mode == Box && c.pointer == Clear),
@@ -233,6 +250,18 @@ fn row_specs(keys: &Keys) -> Vec<(bool, Vec<Version>)> {
 				}),
 				mouse_or(keys.cancel, "Cancel", |c| {
 					c.mode == Quit && c.pointer == Choice(Secondary)
+				}),
+				mouse_or(keys.settings, "Settings", |c| c.mode == Box && c.pointer == Gear),
+				mouse("Switch on or off", |c| c.mode == Settings && c.pointer == Switch),
+				mouse("Change the keybind", |c| {
+					c.mode == Settings && c.pointer == Bind && !c.recording
+				}),
+				mouse("Stop waiting for a key", |c| {
+					c.mode == Settings && c.pointer == Bind && c.recording
+				}),
+				mouse("Choose", |c| c.mode == Settings && c.pointer == Pick),
+				mouse("Reset everything to defaults", |c| {
+					c.mode == Settings && c.pointer == Reset
 				}),
 			],
 		),
@@ -258,6 +287,18 @@ fn row_specs(keys: &Keys) -> Vec<(bool, Vec<Version>)> {
 				"Nudge 1 px",
 				|c| c.mode == Box && c.has_box,
 			)],
+		),
+		(
+			false,
+			vec![(caps(keys.undo), "Undo", |c| {
+				c.mode == Box && c.can_undo && c.pointer != Undo
+			})],
+		),
+		(
+			false,
+			vec![(caps(keys.redo), "Redo", |c| {
+				c.mode == Box && c.can_redo && c.pointer != Redo
+			})],
 		),
 		(
 			false,
@@ -293,7 +334,20 @@ fn row_specs(keys: &Keys) -> Vec<(bool, Vec<Version>)> {
 			})],
 		),
 		(false, vec![(caps(keys.close), "Close", close_row)]),
-		(false, vec![(caps(keys.quit), "Quit snap", |c| c.mode == Box)]),
+		(
+			false,
+			vec![(caps(keys.settings), "Settings", |c| c.mode == Box && c.pointer != Gear)],
+		),
+		// the settings menu's
+		(
+			false,
+			vec![
+				(vec![text("Esc", 0x1B)], "Close settings", |c| {
+					c.mode == Settings && !c.recording
+				}),
+				(vec![text("Esc", 0x1B)], "Unbind", |c| c.mode == Settings && c.recording),
+			],
+		),
 		// the quit confirmation's
 		(
 			false,
@@ -426,10 +480,13 @@ impl Hints {
 							shapes.push(Shape::ClippedFill(inset(body, stroke), left_button));
 						}
 					}
+					// only an unbound action's "None" cap has no key pressing it
+					let unbound = capped && codes.is_empty();
 					parts.push(Part {
 						codes,
 						shapes,
 						held: false,
+						unbound,
 					});
 					x += key_width + s(KEY_GAP);
 				}
@@ -442,6 +499,7 @@ impl Hints {
 					codes: Vec::new(),
 					shapes: vec![Shape::Text(origin, text, outlines)],
 					held: false,
+					unbound: false,
 				});
 				variants.push(Variant {
 					parts,
@@ -547,11 +605,15 @@ impl Hints {
 			for variant in row.variants.iter().filter(|variant| variant.opacity > 0.0) {
 				unsafe { render_target.SetTransform(&Matrix3x2::translation(0.0, row.top)) };
 				// drawn solid and faded as one, so the white doesn't let its black stroke show through; held keys
-				// separately, brighter (their strokes don't reach their neighbors)
-				for (held, shown) in [(false, OPACITY), (true, HELD_OPACITY)] {
+				// separately, brighter, and "None" caps dimmer (their strokes don't reach their neighbors)
+				for (held, unbound, shown) in [
+					(false, false, OPACITY),
+					(true, false, HELD_OPACITY),
+					(false, true, OPACITY * UNBOUND_OPACITY),
+				] {
 					let shapes = || {
 						(variant.parts.iter())
-							.filter(move |part| part.held == held)
+							.filter(move |part| part.held == held && part.unbound == unbound)
 							.flat_map(|part| &part.shapes)
 					};
 					if shapes().next().is_none() {

@@ -21,6 +21,7 @@ mod overlay;
 mod render;
 mod save;
 mod selection;
+mod settings;
 mod tray;
 
 use windows::Win32::Foundation::{
@@ -51,7 +52,9 @@ fn main() -> Result<()> {
 		SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
 	}
 	let window = overlay::create()?;
-	let _hook = hook::install(window, overlay::WM_SNAP_KEY, config::load().keys.capture)?;
+	config::init();
+	let config = config::load();
+	let _hook = hook::install(window, overlay::WM_SNAP_KEY, config.keys.capture)?;
 	// the rest of the config is read when the overlay opens
 	config::watch(|config| hook::set_capture(config.keys.capture));
 	// PrtScr still works without the icon (for example before Explorer has started); it's added when the

@@ -1,6 +1,6 @@
 // gdi
 
-// A 32-bit pixel buffer that GDI can draw into, for taking screenshots.
+// A 32-bit pixel buffer that GDI can draw into, for taking screenshots and showing the see-through settings menu.
 
 use windows::Win32::Graphics::Gdi::{
 	BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,

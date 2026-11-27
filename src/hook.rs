@@ -3,7 +3,7 @@
 // Takes over the capture key with a low-level keyboard hook, so PrtScr works even when Windows would open the Snipping
 // Tool.
 
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -27,6 +27,12 @@ static CAPTURE: AtomicU32 = AtomicU32::new(0); // the capture chord, from `Chord
 // The key of the capture press the hook swallowed (0 for none), so it swallows the matching release and ignores key
 // repeat.
 static HELD: AtomicU32 = AtomicU32::new(0);
+// Whether the settings menu is waiting for a keybind, so every key press goes to it instead.
+static RECORDING: AtomicBool = AtomicBool::new(false);
+
+// `message`'s `wparam` for a key press taken while recording, with the chord's `Chord::to_bits` in `lparam`. It's 0 for
+// the capture key.
+pub const RECORDED: usize = 1;
 
 // An unassigned virtual-key code, tapped to keep Windows from treating a lone Alt or Win release as a press of it.
 const MASK_KEY: u16 = 0xE8;
@@ -45,6 +51,23 @@ pub fn install(target: HWND, message: u32, capture: Chord) -> Result<HHOOK> {
 // Changes the capture chord. Safe from any thread.
 pub fn set_capture(capture: Chord) {
 	CAPTURE.store(capture.to_bits(), Ordering::Relaxed);
+}
+
+// Starts or stops sending every key press (with its modifiers, which pass through as usual) to the target as
+// `RECORDED`, swallowing it, so the settings menu can take any chord as a keybind: PrtScr and Alt+F4 included.
+pub fn record(on: bool) {
+	RECORDING.store(on, Ordering::Relaxed);
+}
+
+fn is_modifier(key: u32) -> bool {
+	// Shift, Ctrl and Alt, their left and right versions, and both Win keys
+	matches!(key, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C) || key == MASK_KEY as u32
+}
+
+fn post(wparam: usize, lparam: isize) {
+	let target = HWND(TARGET.load(Ordering::Relaxed) as *mut _);
+	let message = MESSAGE.load(Ordering::Relaxed) as u32;
+	let _ = unsafe { PostMessageW(Some(target), message, WPARAM(wparam), LPARAM(lparam)) };
 }
 
 fn held_modifiers() -> [bool; 4] {
@@ -80,6 +103,26 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 		let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
 		let capture = Chord::from_bits(CAPTURE.load(Ordering::Relaxed));
 		match wparam.0 as u32 {
+			WM_KEYDOWN | WM_SYSKEYDOWN if RECORDING.load(Ordering::Relaxed) && !is_modifier(info.vkCode) => {
+				if HELD.load(Ordering::Relaxed) == info.vkCode {
+					return LRESULT(1);
+				}
+				HELD.store(info.vkCode, Ordering::Relaxed);
+				let [ctrl, shift, alt, win] = held_modifiers();
+				if alt || win {
+					mask_modifiers();
+				}
+				let chord = Chord {
+					ctrl,
+					shift,
+					alt,
+					win,
+					key: info.vkCode as u16,
+				};
+				post(RECORDED, chord.to_bits() as isize);
+				return LRESULT(1);
+			}
+			// an unbound capture key has key code 0, which no press has
 			WM_KEYDOWN | WM_SYSKEYDOWN if info.vkCode == capture.key as u32 => {
 				// key repeat of a press already taken
 				if HELD.load(Ordering::Relaxed) == info.vkCode {
@@ -91,9 +134,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 					if capture.alt || capture.win {
 						mask_modifiers();
 					}
-					let target = HWND(TARGET.load(Ordering::Relaxed) as *mut _);
-					let message = MESSAGE.load(Ordering::Relaxed) as u32;
-					let _ = unsafe { PostMessageW(Some(target), message, WPARAM(0), LPARAM(0)) };
+					post(0, 0);
 					return LRESULT(1);
 				}
 			}

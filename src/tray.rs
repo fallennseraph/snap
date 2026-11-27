@@ -19,6 +19,7 @@ use windows::core::{Error, PCWSTR, Result, w};
 // Sent to the overlay window for clicks on the icon, with the mouse message in `lparam`.
 pub const WM_TRAY: u32 = WM_APP + 2;
 pub const MENU_QUIT: usize = 1;
+pub const MENU_SETTINGS: usize = 2;
 
 const ICON_ID: usize = 1; // the icon's resource ID in snap.rc
 const TRAY_ID: u32 = 1;
@@ -72,6 +73,7 @@ pub fn is_taskbar_created(msg: u32) -> bool {
 pub fn show_menu(window: HWND) -> usize {
 	unsafe {
 		let Ok(menu) = CreatePopupMenu() else { return 0 };
+		let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings"));
 		let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit"));
 		let mut cursor = POINT::default();
 		let _ = GetCursorPos(&mut cursor);

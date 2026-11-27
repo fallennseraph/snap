@@ -9,6 +9,7 @@ serde = { version = "1", features = ["derive"] }
 windows-core = "0.62"
 windows-numerics = "0.3"
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 windows = { version = "0.62", features = [
 	"Win32_Foundation",
 	"Win32_Graphics_Direct2D",

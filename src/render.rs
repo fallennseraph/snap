@@ -140,8 +140,9 @@ pub fn highlight(r: Rect, grip: Grip, thickness: i32, length: i32) -> Vec<Rect> 
 }
 
 // Where the position label goes: just above the box's top-left corner and its outline (and above the size label and
-// buttons when they're above the box too), or just inside the box when that would go off the top of the screen. Kept
-// on screen horizontally.
+// buttons when they're above the box too), or a gap inside the box's top-left corner when that would go off the top of
+// the screen. A box too narrow to fit it inside gets it beside its top corner instead (see `beside`). Kept on screen
+// horizontally.
 pub fn position_label(
 	r: Rect,
 	label_width: i32,
@@ -150,15 +151,32 @@ pub fn position_label(
 	under: &Under,
 	screen_width: i32,
 ) -> (i32, i32) {
-	let x = r.left.min(screen_width - label_width).max(0);
 	let top = if under.bottom() <= r.top {
 		under.top()
 	} else {
 		r.top - 1
 	};
 	let above = top - gap - label_height;
-	let y = if above >= 0 { above } else { r.top + gap };
-	(x, y)
+	if above >= 0 {
+		return (r.left.min(screen_width - label_width).max(0), above);
+	}
+	let x = if r.width() >= label_width + 2 * gap {
+		(r.left + gap).min(screen_width - label_width).max(0)
+	} else {
+		beside(r, label_width, gap, screen_width)
+	};
+	(x, r.top + gap)
+}
+
+// The left edge for something `width` wide beside the box: a gap outside its outline on the right, or on the left when
+// there's no room on the right.
+fn beside(r: Rect, width: i32, gap: i32, screen_width: i32) -> i32 {
+	let right_side = r.right + 1 + gap;
+	if right_side + width <= screen_width {
+		right_side
+	} else {
+		(r.left - 1 - gap - width).max(0)
+	}
 }
 
 // Where the size label and the row of buttons go, from `under_box`.
@@ -203,9 +221,9 @@ fn sized(left: i32, top: i32, width: i32, height: i32) -> Rect {
 }
 
 // Whether the row of buttons goes under the size label instead of beside it: when the two would touch (on a narrow
-// box), even with the row pulled inside the box's corner.
+// box), even with both pulled inside the box's corners.
 pub fn is_stacked(r: Rect, label_width: i32, row_width: i32, gap: i32, screen_width: i32) -> bool {
-	let label_x = r.left.min(screen_width - label_width).max(0);
+	let label_x = (r.left + gap).min(screen_width - label_width).max(0);
 	let row_left = (r.right - gap - row_width).min(screen_width - row_width).max(0);
 	label_x + label_width + gap > row_left
 }
@@ -215,8 +233,9 @@ pub fn is_stacked(r: Rect, label_width: i32, row_width: i32, gap: i32, screen_wi
 // label centered on the row. When `stacked` (see `is_stacked`), the row goes under the label instead, lined up with
 // it.
 //
-// When that would go off the bottom of the screen, they go just inside the box's bottom corners, or above its top
-// corners if the box is too short for that. Kept on screen horizontally.
+// When that would go off the bottom of the screen, they go a gap inside the box's bottom corners, or beside the box
+// (stacked, see `beside`) if it's too narrow for them, or above its top corners if it's too short. Kept on screen
+// horizontally.
 pub fn under_box(
 	r: Rect,
 	label: (i32, i32),
@@ -227,10 +246,11 @@ pub fn under_box(
 ) -> Under {
 	let ((label_width, label_height), (row_width, row_height)) = (label, buttons);
 	let (screen_width, screen_height) = screen;
-	let label_x = r.left.min(screen_width - label_width).max(0);
 	let row = |left: i32, top: i32| sized(left.min(screen_width - row_width).max(0), top, row_width, row_height);
-	// with the row's right edge at `right` (unless it's stacked) and the top of both at `top`
-	let place = |right: i32, top: i32| {
+	// with the label's left edge at `left`, the row's right edge at `right` (unless it's stacked) and the top of both at
+	// `top`
+	let place = |left: i32, right: i32, top: i32, stacked: bool| {
+		let label_x = left.min(screen_width - label_width).max(0);
 		if !stacked {
 			Under {
 				label: sized(
@@ -249,17 +269,24 @@ pub fn under_box(
 		}
 	};
 	// `place` at a top of 0 gives the height of the pair
-	let height = |right: i32| place(right, 0).bottom() - place(right, 0).top();
+	let height = |stacked: bool| {
+		let pair = place(0, row_width, 0, stacked);
+		pair.bottom() - pair.top()
+	};
 
-	let below = place(r.right + 1, r.bottom + 1 + gap);
+	let below = place(r.left, r.right + 1, r.bottom + 1 + gap, stacked);
 	if below.bottom() <= screen_height {
 		return below;
 	}
-	let inside = place(r.right - gap, r.bottom - gap - height(r.right - gap));
-	if inside.top() >= r.top + gap {
-		return inside;
+	let inside_top = r.bottom - gap - height(stacked);
+	if inside_top >= r.top + gap {
+		if r.width() >= label_width.max(row_width) + 2 * gap {
+			return place(r.left + gap, r.right - gap, inside_top, stacked);
+		}
+		let left = beside(r, label_width.max(row_width), gap, screen_width);
+		return place(left, left, r.bottom - gap - height(true), true);
 	}
-	place(r.right + 1, r.top - 1 - gap - height(r.right + 1))
+	place(r.left, r.right + 1, r.top - 1 - gap - height(stacked), stacked)
 }
 
 #[cfg(test)]
@@ -290,7 +317,16 @@ mod tests {
 	#[test]
 	fn label_moves_inside_at_top_of_screen() {
 		let r = rect(100, 10, 300, 200);
-		assert_eq!(position_label(r, 80, 16, 4, &under(r), 1920), (100, 14));
+		assert_eq!(position_label(r, 80, 16, 4, &under(r), 1920), (104, 14));
+	}
+
+	#[test]
+	fn label_goes_beside_a_skinny_box_at_top_of_screen() {
+		let r = rect(100, 10, 140, 200);
+		assert_eq!(position_label(r, 80, 16, 4, &under(r), 1920), (145, 14));
+		// on the left with no room on the right
+		let r = rect(1880, 10, 1920, 200);
+		assert_eq!(position_label(r, 80, 16, 4, &under(r), 1920), (1795, 14));
 	}
 
 	#[test]
@@ -329,19 +365,35 @@ mod tests {
 		assert_eq!(
 			under(r),
 			Under {
-				label: rect(100, 1046, 160, 1062),
+				label: rect(104, 1046, 164, 1062),
 				buttons: rect(216, 1042, 296, 1066),
 			}
 		);
 		// stacked on a narrow box, the label above the buttons
+		let r = rect(100, 100, 200, 1070);
+		assert_eq!(
+			under(r),
+			Under {
+				label: rect(104, 1022, 164, 1038),
+				buttons: rect(104, 1042, 184, 1066),
+			}
+		);
+	}
+
+	#[test]
+	fn they_go_beside_a_skinny_box_at_bottom_of_screen() {
 		let r = rect(100, 100, 150, 1070);
 		assert_eq!(
 			under(r),
 			Under {
-				label: rect(100, 1022, 160, 1038),
-				buttons: rect(100, 1042, 180, 1066),
+				label: rect(155, 1022, 215, 1038),
+				buttons: rect(155, 1042, 235, 1066),
 			}
 		);
+		// on the left with no room on the right
+		let r = rect(1880, 100, 1920, 1070);
+		assert_eq!(under(r).label.left, 1795);
+		assert_eq!(under(r).buttons.left, 1795);
 	}
 
 	#[test]
@@ -354,9 +406,10 @@ mod tests {
 
 	#[test]
 	fn stacking_leaves_room_for_the_row_pulled_inside() {
-		// label 100..160, gap, row 80 wide ending a gap inside the right edge: 100 + 60 + 4 + 80 + 4 = 248
-		assert!(!is_stacked(rect(100, 100, 248, 200), 60, 80, 4, 1920));
-		assert!(is_stacked(rect(100, 100, 247, 200), 60, 80, 4, 1920));
+		// label 104..164 (a gap inside the left edge), gap, row 80 wide ending a gap inside the right edge:
+		// 100 + 4 + 60 + 4 + 80 + 4 = 252
+		assert!(!is_stacked(rect(100, 100, 252, 200), 60, 80, 4, 1920));
+		assert!(is_stacked(rect(100, 100, 251, 200), 60, 80, 4, 1920));
 	}
 
 	#[test]
