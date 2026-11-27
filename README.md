@@ -1,9 +1,13 @@
 # snap
 A lightweight screenshot tool for Windows coded in Rust.
 
+![Image: UI preview](assets/preview1.png)
+
+## Motivation
+
 Takes inspiration from [Lightshot](https://app.prntscr.com/en/index.html).
 
-![Image: UI preview](assets/preview1.png)
+I created Snap because I got annoyed from acidentally uploading my screenshots, which was a feature I didn't need.
 
 ## Usage
 
