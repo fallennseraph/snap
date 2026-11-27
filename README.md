@@ -7,7 +7,7 @@ A lightweight screenshot tool for Windows coded in Rust.
 
 Snap is heavily inspired by [Lightshot](https://app.prntscr.com/en/index.html) and features a similar user experience. I created Snap as a fun weekend project, taking some inspiration from Lightshot and changing a few things I didn't like.
 
-Snap's is primarily coded with AI. I designed the features and tested the app.
+Disclaimer: Snap's is primarily coded with AI. I designed the features and tested the app.
 
 ## Usage
 
