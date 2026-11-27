@@ -1,2 +1,2 @@
 // The exe icon, also loaded for the tray. The ID matches ICON_ID in src/tray.rs.
-1 ICON "icon.ico"
+1 ICON "assets/icon.ico"
